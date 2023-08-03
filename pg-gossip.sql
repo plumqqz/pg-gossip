@@ -1,0 +1,129 @@
+-- CONNECTION: url=jdbc:postgresql://localhost:5432/work
+call exec_at_all_hosts($sql2script$
+--------------------------------------------------
+
+--create schema gsp;
+--CREATE OR REPLACE FUNCTION gsp.gen_v7_uuid()
+-- RETURNS uuid
+-- LANGUAGE plpgsql
+-- PARALLEL SAFE
+--AS $function$
+--declare
+-- tp text = lpad(to_hex(floor(extract(epoch from clock_timestamp())*1000)::int8),12,'0')||'7';
+-- entropy text = md5(gen_random_uuid()::text);
+-- begin
+--    return (tp || substring(entropy from 1 for 3) || to_hex(8+(random()*3)::int) || substring(entropy from 4 for 15))::uuid;
+-- end
+--$function$
+--;
+--CREATE OR REPLACE FUNCTION gsp.gen_v8_uuid(ts timestamp without time zone, v text)
+-- RETURNS uuid
+-- LANGUAGE plpgsql
+-- PARALLEL SAFE
+--AS $function$
+--declare
+-- hash text = encode(sha256(v::bytea),'hex');
+-- tp text = lpad(to_hex((extract(epoch from ts)::int8*1000)),12,'0');
+-- begin
+--    return (tp ||'8'|| substring(hash from 2 for 3)||'8'||substring(hash from 6 for 15))::uuid;
+-- end
+--$function$
+--;
+--
+--
+--
+--
+--create table gsp.gsp(
+-- uuid uuid primary key,
+-- topic varchar(64) not null,
+-- payload json
+--);
+--
+--create table gsp.peer(
+-- name varchar(64) primary key,
+-- conn_str text not null
+--);
+--
+--create table gsp.peer_gsp(
+--    peer_name varchar(64) references gsp.peer(name),
+--    gsp_uuid uuid not null references gsp.gsp(uuid)
+--);
+--
+--create table gsp.mapping(
+-- topic varchar(64) primary key,
+-- handler text not null
+--);
+
+
+
+--create or replace function gsp.handle_peer(payload json) returns void as
+--$code$
+--begin
+--    insert into gsp.peer(name, conn_str)values(payload->>'name', payload->>'conn_str') on conflict(name) do update set conn_str=excluded.conn_str;
+--end;
+--$code$
+--language plpgsql;
+         
+--create or replace function gsp.i_have(gsps uuid[]) returns table(uuid uuid) as 
+--$code$
+--begin
+--    return query select 
+--            gsps.uuid 
+--    from unnest(gsps) gsps 
+--    where not exists(select * from gsp.gsp where gsp.uuid=gsps.uuid)
+--    and coalesce(gsps.uuid>(select gsp.uuid from gsp.gsp order by gsp.uuid limit 1), true); 
+--end;
+--$code$
+--language plpgsql;
+--
+--create or replace function gsp.send_gsp(gsps gsp.gsp[]) returns text as
+--$code$
+--declare
+--    r record;
+--begin
+--    insert into gsp.gsp select gsps.* from unnest(gsps) as gsps on conflict do nothing;
+--    insert into gsp.peer_gsp select p.name, gsps.uuid from gsp.peer p, unnest(gsps) as gsps;
+--    for r in select gsp.*, m.* from unnest(gsps) as gsp, gsp.mapping m where gsp.topic=m.topic loop
+--        raise notice '%', format('select %s($1)', r.handler);
+--        execute format('select %s($1)', r.handler) using r.payload;
+--    end loop;
+--    return 'OK';
+--end;
+--$code$
+--language plpgsql;
+
+--create or replace function gsp.gossip(topic text, payload json) returns text as
+--$code$
+--begin
+--    perform gsp.send_gsp(array[(gsp.gen_v7_uuid(), topic, payload)::gsp.gsp]);
+--    return 'OK';
+--end;
+--$code$
+--language plpgsql;
+
+--create or replace function gsp.spread_gossips(peer_name text) returns int as
+--$code$
+--declare
+--    gsps uuid[]=array(select pg.gsp_uuid from gsp.peer_gsp pg where pg.peer_name=spread_gossips.peer_name order by gsp_uuid limit 1000);
+--    sendme uuid[];
+--    conn_str text = (select p.conn_str from gsp.peer p where p.name=spread_gossips.peer_name);
+--begin
+--    if conn_str is null then
+--        raise notice 'spread_gossips:Unknown peer:%', peer_name;
+--        return 0; 
+--    end if;
+--    sendme=array(select uuid from dblink.dblink(conn_str, 
+--        format($q$select uuid from gsp.i_have(%L)$q$, gsps)) as rs(uuid uuid));
+--    if sendme is null or cardinality(sendme)=0 then
+--        delete from gsp.peer_gsp pg where pg.peer_name=spread_gossips.peer_name and pg.gsp_uuid=any(gsps);
+--        return 0;
+--    end if;
+--    perform from dblink.dblink(conn_str,format('select gsp.send_gsp(%L::gsp.gsp[])', (select array_agg(gsp) from gsp.gsp where uuid=any(sendme)))) as rs(v text);
+--    delete from gsp.peer_gsp pg where pg.peer_name=spread_gossips.peer_name and pg.gsp_uuid=any(gsps);
+--    return cardinality(gsps);
+--end;
+--$code$
+--language plpgsql;
+
+ ------------------------------------------------------------------
+         $sql2script$::text);
