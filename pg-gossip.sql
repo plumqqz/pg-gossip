@@ -1,8 +1,10 @@
 -- CONNECTION: url=jdbc:postgresql://localhost:5432/work
 call exec_at_all_hosts($sql2script$
 --------------------------------------------------
-
 --create schema gsp;
+--create table gsp.self(id int primary key default 1 check(id=1), name varchar(64) not null check (name~'^[a-zA-Z][A-Za-z0-9]*$'));
+--alter table gsp.self add column if not exists group_name text not null default 'default';
+-- alter table gsp.self add column if not exists conn_str text;
 --CREATE OR REPLACE FUNCTION gsp.gen_v7_uuid()
 -- RETURNS uuid
 -- LANGUAGE plpgsql
@@ -29,8 +31,19 @@ call exec_at_all_hosts($sql2script$
 -- end
 --$function$
 --;
---
---
+
+--create or replace function gsp.check_group(group_name text) returns boolean as
+--$code$
+--begin
+--    if not exists(select * from gsp.self where self.group_name=check_group.group_name) then
+--        raise sqlstate 'LB001' using message=format('Invalid group:%s', group_name);
+--    end if;
+--    return true;
+--end;
+--$code$
+--language plpgsql;
+
+
 --
 --
 --create table gsp.gsp(
@@ -40,9 +53,10 @@ call exec_at_all_hosts($sql2script$
 --);
 --
 --create table gsp.peer(
--- name varchar(64) primary key,
+-- name varchar(64) primary key check (name ~ '^[a-zA-Z][a-zA-Z0-9]+$'),
 -- conn_str text not null
 --);
+
 --
 --create table gsp.peer_gsp(
 --    peer_name varchar(64) references gsp.peer(name),
@@ -56,9 +70,12 @@ call exec_at_all_hosts($sql2script$
 
 
 
---create or replace function gsp.handle_peer(payload json) returns void as
+--create or replace function gsp.handle_peer(iuuid uuid, payload json) returns void as
 --$code$
 --begin
+--    if exists(select * from gsp.self where name=payload->>name) then
+--        return;
+--    end if;
 --    insert into gsp.peer(name, conn_str)values(payload->>'name', payload->>'conn_str') on conflict(name) do update set conn_str=excluded.conn_str;
 --end;
 --$code$
@@ -82,21 +99,22 @@ call exec_at_all_hosts($sql2script$
 --    r record;
 --begin
 --    insert into gsp.gsp select gsps.* from unnest(gsps) as gsps on conflict do nothing;
---    insert into gsp.peer_gsp select p.name, gsps.uuid from gsp.peer p, unnest(gsps) as gsps;
---    for r in select gsp.*, m.* from unnest(gsps) as gsp, gsp.mapping m where gsp.topic=m.topic loop
---        raise notice '%', format('select %s($1)', r.handler);
---        execute format('select %s($1)', r.handler) using r.payload;
+--    insert into gsp.peer_gsp select p.name, gsps.uuid from gsp.peer p, unnest(gsps) as gsps on conflict do nothing;
+--    for r in select gsp.*, m.* from unnest(gsps) as gsp, gsp.mapping m where m.topic like gsp.topic loop
+--        execute format('select %s($1, $2)', r.handler) using r.uuid, r.payload;
 --    end loop;
 --    return 'OK';
 --end;
 --$code$
 --language plpgsql;
 
---create or replace function gsp.gossip(topic text, payload json) returns text as
+--create or replace function gsp.gossip(topic text, payload json) returns uuid as
 --$code$
+--declare
+-- iuuid uuid = gsp.gen_v7_uuid();
 --begin
---    perform gsp.send_gsp(array[(gsp.gen_v7_uuid(), topic, payload)::gsp.gsp]);
---    return 'OK';
+--    perform gsp.send_gsp(array[(iuuid, topic, payload)::gsp.gsp]);
+--    return iuuid;
 --end;
 --$code$
 --language plpgsql;
@@ -104,16 +122,21 @@ call exec_at_all_hosts($sql2script$
 --create or replace function gsp.spread_gossips(peer_name text) returns int as
 --$code$
 --declare
---    gsps uuid[]=array(select pg.gsp_uuid from gsp.peer_gsp pg where pg.peer_name=spread_gossips.peer_name order by gsp_uuid limit 1000);
+--    gsps uuid[]=array(select pg.gsp_uuid from gsp.peer_gsp pg where pg.peer_name=spread_gossips.peer_name order by gsp_uuid for update skip locked limit 1000);
 --    sendme uuid[];
 --    conn_str text = (select p.conn_str from gsp.peer p where p.name=spread_gossips.peer_name);
+--    self gsp.self;
 --begin
 --    if conn_str is null then
---        raise notice 'spread_gossips:Unknown peer:%', peer_name;
+--        raise notice 'spread_gossips(%):Unknown peer:%', (select name from gsp.self), peer_name;
 --        return 0; 
 --    end if;
+--    if cardinality(gsps)=0 then
+--        return 0;
+--    end if;
+--    select * into self from gsp.self;
 --    sendme=array(select uuid from dblink.dblink(conn_str, 
---        format($q$select uuid from gsp.i_have(%L)$q$, gsps)) as rs(uuid uuid));
+--        format($q$select uuid from gsp.i_have(%L) where gsp.check_group(%L)$q$, gsps, self.group_name)) as rs(uuid uuid));
 --    if sendme is null or cardinality(sendme)=0 then
 --        delete from gsp.peer_gsp pg where pg.peer_name=spread_gossips.peer_name and pg.gsp_uuid=any(gsps);
 --        return 0;
@@ -125,5 +148,69 @@ call exec_at_all_hosts($sql2script$
 --$code$
 --language plpgsql;
 
- ------------------------------------------------------------------
+
+--create or replace procedure gsp.constantly_spread_gossips(peer text) as 
+--$code$
+--declare
+--   cnt int;
+--   ok boolean;
+--begin
+--    while true loop
+--        begin
+--            cnt=gsp.spread_gossips(peer);
+--            ok = true;
+--        exception
+--            when sqlstate '08000' then
+--                ok = false;
+--                raise notice 'Connection problems:%', sqlerrm;
+--        end;
+--        if ok then
+--            commit;
+--            if cnt=0 then
+--                perform pg_sleep(3);
+--            end if;
+--        else
+--            rollback;
+--            perform pg_sleep(30);
+--        end if;
+--    end loop;
+--end;
+--$code$
+--language plpgsql
+
+--**********************************
+--************ LEDGER **************
+--**********************************
+--create schema ldg;
+--
+--create table ldg.txpool(
+-- uuid uuid primary key,
+-- payload json not null
+--);
+--
+--
+--create table ldg.ldg(
+--    uuid uuid primary key,
+--    payload json[] not null
+--);
+--
+--create or replace function ldg.broadcast_tx(tx json) returns uuid as
+--$code$
+--    begin
+--        return gsp.gossip('txpool',tx);
+--    end;
+--$code$
+--language plpgsql;
+--
+
+--create or replace function ldg.handle_txpool(iuuid uuid, payload json) returns void as
+--$code$
+--begin
+--    insert into ldg.txpool(uuid, payload) values(iuuid, payload) on conflict do nothing;
+--end;
+--$code$
+--language plpgsql;
+
+
+------------------------------------------------------------------
          $sql2script$::text);

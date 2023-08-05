@@ -1,15 +1,12 @@
 #!/bin/bash
 PSQL=/usr/bin/psql
-PSQL_OPTS="host=localhost user=postgres password=root dbname=work"
+#PSQL_OPTS="host=localhost user=postgres password=root dbname=work"
+[[ ! "$1" ]] && PSQL_OPTS="host=localhost user=postgres password=root dbname=work" || PSQL_OPTS=$1
 
 trap 'kill $(jobs -p)' EXIT TERM INT
 
 function spread_to_peer(){
-  while true; do
-     $PSQL -X "$PSQL_OPTS" -c "select gsp.spread_gossips('$1')" >/dev/null
-     echo Sleeping
-     sleep 1
-  done
+     $PSQL -X "$PSQL_OPTS" -c "call gsp.constantly_spread_gossips('$1')" >/dev/null
 }
 
 echo "$PSQL $PSQL_OPTS"
@@ -22,5 +19,6 @@ for peer in $peers ; do
      pids[i++]=$!
 done
 
-echo Pids: $pids
-wait $pids
+if [ "X$pids" != "X" ]; then
+    wait $pids
+fi
