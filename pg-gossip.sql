@@ -32,6 +32,20 @@ call exec_at_all_hosts($sql2script$
 --$function$
 --;
 
+--CREATE OR REPLACE FUNCTION gsp.gen_v7_uuid(ts timestamp without time zone)
+-- RETURNS uuid
+-- LANGUAGE plpgsql
+-- PARALLEL SAFE
+--AS $function$
+--declare
+-- tp text = lpad(to_hex(floor(extract(epoch from ts)*1000)::int8),12,'0')||'7';
+-- begin
+--    return (tp || '0008000000000000000')::uuid;
+-- end
+--$function$
+--;
+
+
 --create or replace function gsp.check_group(group_name text) returns boolean as
 --$code$
 --begin
@@ -43,6 +57,15 @@ call exec_at_all_hosts($sql2script$
 --$code$
 --language plpgsql;
 
+--create or replace procedure gsp.clear_gsp() as
+--$code$
+--begin
+--    delete from gsp.gsp where not exists(select * from gsp.peer_gsp pg where gsp.uuid=pg.gsp_uuid) and gsp.uuid<gsp.gen_v7_uuid(now()::timestamp-make_interval(hours:=2))
+--        and gsp.uuid<>(select uuid from gsp.gsp order by uuid desc limit 1);
+--end;
+--$code$
+--language plpgsql
+
 
 --
 --
@@ -53,9 +76,10 @@ call exec_at_all_hosts($sql2script$
 --);
 --
 --create table gsp.peer(
--- name varchar(64) primary key check (name ~ '^[a-zA-Z][a-zA-Z0-9]+$'),
+-- name varchar(64) primary key check (name ~ '^[a-zA-Z][a-zA-Z0-9]*$'),
 -- conn_str text not null
 --);
+--alter table gsp.peer alter column connected_at type timestamptz;
 
 --
 --create table gsp.peer_gsp(
@@ -122,7 +146,11 @@ call exec_at_all_hosts($sql2script$
 --create or replace function gsp.spread_gossips(peer_name text) returns int as
 --$code$
 --declare
---    gsps uuid[]=array(select pg.gsp_uuid from gsp.peer_gsp pg where pg.peer_name=spread_gossips.peer_name order by gsp_uuid for update skip locked limit 1000);
+--    gsps uuid[]=array(select pg.gsp_uuid 
+--                        from gsp.peer_gsp pg 
+--                       where pg.peer_name=spread_gossips.peer_name
+--                         and pg.gsp_uuid>gsp.gen_v7_uuid(now()::timestamp-make_interval(days:=1))
+--                    order by gsp_uuid for update skip locked limit 1000);
 --    sendme uuid[];
 --    conn_str text = (select p.conn_str from gsp.peer p where p.name=spread_gossips.peer_name);
 --    self gsp.self;
@@ -137,6 +165,7 @@ call exec_at_all_hosts($sql2script$
 --    select * into self from gsp.self;
 --    sendme=array(select uuid from dblink.dblink(conn_str, 
 --        format($q$select uuid from gsp.i_have(%L) where gsp.check_group(%L)$q$, gsps, self.group_name)) as rs(uuid uuid));
+--    update gsp.peer set connected_at=now() where name=peer_name;
 --    if sendme is null or cardinality(sendme)=0 then
 --        delete from gsp.peer_gsp pg where pg.peer_name=spread_gossips.peer_name and pg.gsp_uuid=any(gsps);
 --        return 0;
@@ -157,6 +186,7 @@ call exec_at_all_hosts($sql2script$
 --begin
 --    while true loop
 --        begin
+--            raise notice 'Sending gossips';
 --            cnt=gsp.spread_gossips(peer);
 --            ok = true;
 --        exception
@@ -178,6 +208,8 @@ call exec_at_all_hosts($sql2script$
 --$code$
 --language plpgsql
 
+--insert into gsp.mapping values('peer-height','ldg.handle_peer_height');
+
 --**********************************
 --************ LEDGER **************
 --**********************************
@@ -189,10 +221,6 @@ call exec_at_all_hosts($sql2script$
 --);
 --
 --
---create table ldg.ldg(
---    uuid uuid primary key,
---    payload json[] not null
---);
 --
 --create or replace function ldg.broadcast_tx(tx json) returns uuid as
 --$code$
@@ -211,6 +239,98 @@ call exec_at_all_hosts($sql2script$
 --$code$
 --language plpgsql;
 
+--create table ldg.ldg(
+--    uuid uuid primary key,
+--    height bigint not null,
+--    payload json[] not null
+--);
+
+--create table if not exists ldg.peer_height(
+--    peer_name varchar(64) not null primary key check(peer_name ~'^[a-zA-Z][a-zA-Z0-9]+$'),
+--    height bigint not null
+--);
+
+
+
+--create or replace function ldg.handle_peer_height(uuid uuid, payload json) returns void as
+--$code$
+--begin
+--    insert into ldg.peer_height values(payload->>'name', (payload->>'height')::bigint) on conflict(peer_name) do update set height=excluded.height;
+--end;
+--$code$
+--language plpgsql;
+
+--create or replace procedure ldg.constantly_gossip_my_height() as 
+--$code$
+--begin
+--    while true loop
+--        raise notice 'Sending own height';
+--        perform gsp.gossip('peer-height',json_build_object('name',self.name,'height',coalesce(ldg.max_height,0), 'sent-at',clock_timestamp()))
+--            from gsp.self, (select max(height) as max_height from ldg.ldg) ldg;
+--        commit;
+--        perform pg_sleep(45);
+--    end loop;
+--    
+--end;
+--$code$
+--language plpgsql;
+
+--create or replace function ldg.is_ready() returns boolean as
+--$code$
+--begin
+--    return exists(select * from gsp.peer p where connected_at>now()-make_interval(secs:=90))
+--       and coalesce((select max(height) from ldg.ldg),0)>=coalesce((select max(height) from ldg.peer_height),-1);
+--end;
+--$code$
+--language plpgsql;
+
+--create table ldg.proposed_block(
+--  uuid uuid not null primary key,
+--  peer_name varchar(64) not null check(peer_name ~ '^[a-zA-Z][a-zA-Z0-9]+$'),
+--  height bigint not null,
+--  block json[],
+--  unique(peer_name, height)
+--);
+--
+--create or replace procedure ldg.make_proposed_block(height bigint) as
+--$code$
+--<<code>>
+--declare
+--  p_b ldg.proposed_block;
+--  self gsp.self;
+--begin
+--    select * into self from gsp.self;
+--    if not found then return; end if;
+--    if not ldg.is_ready() or exists(select * from ldg.proposed_block pb where pb.peer_name=self.name and pb.height=make_proposed_block.height)
+--    then
+--        return;
+--    end if;
+--    p_b.uuid=gsp.gen_v7_uuid();
+--    p_b.peer_name = (select name from gsp.self);
+--    p_b.height = height;
+--    p_b.block = array(select payload from ldg.txpool order by uuid limit 1000);
+--    raise notice 'Propose block from % height %', self.name, height;
+--    perform gsp.gossip('proposed-blocks', row_to_json(p_b));
+--end;
+--$code$
+--language plpgsql;
+
+--insert into gsp.mapping values('proposed-blocks', 'ldg.handle_proposed_block');
+
+--create or replace function ldg.handle_proposed_block(uuid uuid, payload json) returns void as
+--$code$
+--declare
+--  p_b ldg.proposed_block;
+--begin
+--    insert into ldg.proposed_block(uuid, peer_name, height, block) 
+--        select (payload->>'uuid')::uuid,
+--               payload->>'peer_name',
+--               (payload->>'height')::bigint,
+--               array(select v from json_array_elements(payload->'block') as v)
+--    on conflict do nothing;
+--end;
+--$code$
+--language plpgsql;
 
 ------------------------------------------------------------------
          $sql2script$::text);
