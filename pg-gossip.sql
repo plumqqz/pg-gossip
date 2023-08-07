@@ -1,10 +1,14 @@
--- CONNECTION: url=jdbc:postgresql://localhost:5432/work
 call exec_at_all_hosts($sql2script$
 --------------------------------------------------
+--create schema if not exists dblink;
+--create extension if not exists dblink with schema dblink;
 --create schema gsp;
---create table gsp.self(id int primary key default 1 check(id=1), name varchar(64) not null check (name~'^[a-zA-Z][A-Za-z0-9]*$'));
---alter table gsp.self add column if not exists group_name text not null default 'default';
--- alter table gsp.self add column if not exists conn_str text;
+--create table gsp.self(id int primary key default 1 check(id=1), 
+--    name varchar(64) not null check (name~'^[a-zA-Z][A-Za-z0-9]*$'),
+--    group_name text not null default 'default',
+--    conn_str text
+--);
+--
 --CREATE OR REPLACE FUNCTION gsp.gen_v7_uuid()
 -- RETURNS uuid
 -- LANGUAGE plpgsql
@@ -31,7 +35,7 @@ call exec_at_all_hosts($sql2script$
 -- end
 --$function$
 --;
-
+--
 --CREATE OR REPLACE FUNCTION gsp.gen_v7_uuid(ts timestamp without time zone)
 -- RETURNS uuid
 -- LANGUAGE plpgsql
@@ -44,8 +48,8 @@ call exec_at_all_hosts($sql2script$
 -- end
 --$function$
 --;
-
-
+--
+--
 --create or replace function gsp.check_group(group_name text) returns boolean as
 --$code$
 --begin
@@ -56,7 +60,7 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
-
+--
 --create or replace procedure gsp.clear_gsp() as
 --$code$
 --begin
@@ -64,9 +68,9 @@ call exec_at_all_hosts($sql2script$
 --        and gsp.uuid<>(select uuid from gsp.gsp order by uuid desc limit 1);
 --end;
 --$code$
---language plpgsql
-
-
+--language plpgsql;
+--
+--
 --
 --
 --create table gsp.gsp(
@@ -77,10 +81,9 @@ call exec_at_all_hosts($sql2script$
 --
 --create table gsp.peer(
 -- name varchar(64) primary key check (name ~ '^[a-zA-Z][a-zA-Z0-9]*$'),
--- conn_str text not null
+-- conn_str text not null,
+-- connected_at timestamptz
 --);
---alter table gsp.peer alter column connected_at type timestamptz;
-
 --
 --create table gsp.peer_gsp(
 --    peer_name varchar(64) references gsp.peer(name),
@@ -91,9 +94,7 @@ call exec_at_all_hosts($sql2script$
 -- topic varchar(64) primary key,
 -- handler text not null
 --);
-
-
-
+--
 --create or replace function gsp.handle_peer(iuuid uuid, payload json) returns void as
 --$code$
 --begin
@@ -104,7 +105,7 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
-         
+--         
 --create or replace function gsp.i_have(gsps uuid[]) returns table(uuid uuid) as 
 --$code$
 --begin
@@ -131,7 +132,7 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
-
+--
 --create or replace function gsp.gossip(topic text, payload json) returns uuid as
 --$code$
 --declare
@@ -142,7 +143,7 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
-
+--
 --create or replace function gsp.spread_gossips(peer_name text) returns int as
 --$code$
 --declare
@@ -176,6 +177,7 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
+--
 
 
 --create or replace procedure gsp.constantly_spread_gossips(peer text) as 
@@ -206,13 +208,16 @@ call exec_at_all_hosts($sql2script$
 --    end loop;
 --end;
 --$code$
---language plpgsql
+--language plpgsql;
 
---insert into gsp.mapping values('peer-height','ldg.handle_peer_height');
 
---**********************************
---************ LEDGER **************
---**********************************
+--insert into gsp.mapping values('peer-height','ldg.handle_peer_height') on conflict do nothing;
+--insert into gsp.mapping values('txpool','ldg.handle_txpool') on conflict do nothing;
+--insert into gsp.mapping values('peer','ldg.handle_peer') on conflict do nothing;
+--
+----**********************************
+----************ LEDGER **************
+----**********************************
 --create schema ldg;
 --
 --create table ldg.txpool(
@@ -230,7 +235,7 @@ call exec_at_all_hosts($sql2script$
 --$code$
 --language plpgsql;
 --
-
+--
 --create or replace function ldg.handle_txpool(iuuid uuid, payload json) returns void as
 --$code$
 --begin
@@ -238,20 +243,20 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
-
+--
 --create table ldg.ldg(
 --    uuid uuid primary key,
 --    height bigint not null,
 --    payload json[] not null
 --);
-
+--
 --create table if not exists ldg.peer_height(
 --    peer_name varchar(64) not null primary key check(peer_name ~'^[a-zA-Z][a-zA-Z0-9]+$'),
 --    height bigint not null
 --);
-
-
-
+--
+--
+--
 --create or replace function ldg.handle_peer_height(uuid uuid, payload json) returns void as
 --$code$
 --begin
@@ -259,7 +264,7 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
-
+--
 --create or replace procedure ldg.constantly_gossip_my_height() as 
 --$code$
 --begin
@@ -274,7 +279,7 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
-
+--
 --create or replace function ldg.is_ready() returns boolean as
 --$code$
 --begin
@@ -283,7 +288,7 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
-
+--
 --create table ldg.proposed_block(
 --  uuid uuid not null primary key,
 --  peer_name varchar(64) not null check(peer_name ~ '^[a-zA-Z][a-zA-Z0-9]+$'),
@@ -291,6 +296,7 @@ call exec_at_all_hosts($sql2script$
 --  block json[],
 --  unique(peer_name, height)
 --);
+
 --
 --create or replace procedure ldg.make_proposed_block(height bigint) as
 --$code$
@@ -314,9 +320,9 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
-
+--
 --insert into gsp.mapping values('proposed-blocks', 'ldg.handle_proposed_block');
-
+--
 --create or replace function ldg.handle_proposed_block(uuid uuid, payload json) returns void as
 --$code$
 --declare
