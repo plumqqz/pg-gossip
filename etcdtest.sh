@@ -15,32 +15,53 @@ CURL=/usr/bin/curl
 
 #exit
 q='"'
-ldg_root=`echo '/ldg/000000000000000'|base64`
+ldg_root=`echo '/ldg/'|base64`
+ldg_root_range_end=`echo /ldg1|base64`
 
 while [ true ] ; do
-  $PSQL -X "$PSQL_OPTS" -c "call ldg.make_proposed_block()" >/dev/null 2>&1
-  if value=`$CURL -s -L ${ETCD_URL}/v3/kv/range -X POST -d "{${q}key${q}: ${q}$ldg_root${q}, ${q}sort_order${q}:${q}DESCEND${q}, ${q}limit${q}:${q}1${q},${q}limit${q}:true }"| jq -r .kvs[0].key`; then
+  if value=`$CURL -s -L ${ETCD_URL}/v3/kv/range -X POST -d "{${q}key${q}: ${q}$ldg_root${q}, ${q}range_end${q}:${q}$ldg_root_range_end${q}, ${q}sort_order${q}:${q}DESCEND${q}, ${q}limit${q}:${q}1${q}}"| jq -r .kvs[0].key`; then
     if [ -z "$value" ] ; then
       sleep 5
       continue
     fi
 
     if test "$value" = "null" ; then
-      height='0'
+      height=0
     else
-      value=`echo "$value"|base64 -d| sed s@/ldg/0*@@`
-      height=`expr $height + 1`
+      old_height=`echo "$value"|base64 -d| sed s@/ldg/0*@@`
+      height=`expr $old_height + 1`
+      echo "Current height is $height"
     fi
+
+    my_height=`$PSQL -X "$PSQL_OPTS" -t --csv -c 'select coalesce(max(height),0) from ldg.ldg'`
+
+    echo "heights $my_height $old_height"
+
+    for ch in `seq $my_height $old_height` ; do
+      key64=`printf '/ldg/%015d' $ch`
+      key64=`echo $key64|base64`
+      reply=`$CURL -s -L $ETCD_URL/v3/kv/range -X POST -d "{${q}key${q}: ${q}$key64${q}}"|jq -r .kvs[0].value`
+
+      if [ "$reply" = "null" ]; then
+        echo "Unexpected reply:$reply"
+        exit
+      fi
+      reply=`echo $reply|base64 -d`
+      reply=`$PSQL -X "$PSQL_OPTS" -c "call ldg.apply_proposed_block('$reply'::uuid)"`
+    done
+
+
     if test "$height" != "" ; then
-      block_uuid=`$PSQL -X "$PSQL_OPTS" --csv -t -c "select ldg.get_proposed_block_at_height($height);"`
+      $PSQL -X "$PSQL_OPTS" -c "call ldg.make_proposed_block()" >/dev/null 2>&1
       key=`printf '/ldg/%015d' $height`
-      echo "[$key]->[$block_uuid]"
+      #echo "[$key]->[$block_uuid]"
       key64=`echo "$key"|base64`
-      block_uuid_b64=`echo $block_uuid|base64`
-      reply=`$CURL -s -L ${ETCD_URL}/v3/kv/txn -X POST -d "{${q}compare${q}:[{${q}createRevision${q}:${q}0${q},${q}target${q}:${q}CREATE${q},${q}key${q}:${q}$key64${q}}],${q}success${q}:[{${q}requestPut${q}:{${q}key${q}:${q}$key64${q},${q}value${q}:${q}$block_uuid_b64${q}}}]}"`
-      echo $reply
-      reply=`$CURL -s -L $ETCD_URL/v3/kv/range -X POST -d "{${q}key${q}: ${q}$key64${q},${q}limit${q}:${q}1${q}"}|jq -r .kvs[0].value|base64 -d`
-      echo $reply
+
+      block_uuid=`$PSQL -X "$PSQL_OPTS" --csv -t -c "select ldg.get_proposed_block_at_height($height);"`
+      if [ -n "$block_uuid" ] ; then
+        block_uuid_b64=`echo $block_uuid|base64`
+        reply=`$CURL -s -L ${ETCD_URL}/v3/kv/txn -X POST -d "{${q}compare${q}:[{${q}createRevision${q}:${q}0${q},${q}target${q}:${q}CREATE${q},${q}key${q}:${q}$key64${q}}],${q}success${q}:[{${q}requestPut${q}:{${q}key${q}:${q}$key64${q},${q}value${q}:${q}$block_uuid_b64${q}}}]}"`
+      fi
     fi
 
     sleep 1

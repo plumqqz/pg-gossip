@@ -246,7 +246,7 @@ call exec_at_all_hosts($sql2script$
 --
 --create table ldg.ldg(
 --    uuid uuid primary key,
---    height bigint not null,
+--    height bigint not null unique,
 --    payload json[] not null
 --);
 --
@@ -298,32 +298,34 @@ call exec_at_all_hosts($sql2script$
 --);
 
 
-create or replace procedure ldg.make_proposed_block() as
-$code$
-<<code>>
-declare
-  p_b ldg.proposed_block;
-  self gsp.self;
-  height bigint = coalesce((select max(height) from ldg.ldg),0);
-begin
-    select * into self from gsp.self;
-    if not found then return; end if;
-    if not ldg.is_ready() or exists(select * from ldg.proposed_block pb where pb.peer_name=self.name and pb.height=code.height)
-    then
-        return;
-    end if;
-    if exists(select * from ldg.ldg where ldg.height>=code.height) then
-        return;
-    end if;
-    p_b.uuid=gsp.gen_v7_uuid();
-    p_b.peer_name = (select name from gsp.self);
-    p_b.height = height;
-    p_b.block = array(select payload from ldg.txpool order by uuid limit 1000);
-    raise notice 'Propose block from % height %', self.name, height;
-    perform gsp.gossip('proposed-blocks', row_to_json(p_b));
-end;
-$code$
-language plpgsql;
+--create or replace procedure ldg.make_proposed_block() as
+--$code$
+--<<code>>
+--declare
+--  p_b ldg.proposed_block;
+--  self gsp.self;
+--  height bigint = coalesce((select max(height)+1 from ldg.ldg),0);
+--begin
+--    select * into self from gsp.self;
+--    if not found then return; end if;
+--    if not ldg.is_ready() or exists(select * from ldg.proposed_block pb where pb.peer_name=self.name and pb.height=code.height)
+--    then
+--        return;
+--    end if;
+--    if exists(select * from ldg.ldg where ldg.height>=code.height) then
+--        return;
+--    end if;
+--    p_b.uuid=gsp.gen_v7_uuid();
+--    p_b.peer_name = (select name from gsp.self);
+--    p_b.height = height;
+--    p_b.block = array(select json_build_object('uuid', txpool.uuid, 'payload', txpool.payload) from ldg.txpool order by uuid limit 1000);
+--    raise notice 'Propose block from % height %', self.name, height;
+--    if cardinality(p_b.block)>0 then
+--        perform gsp.gossip('proposed-blocks', row_to_json(p_b));
+--    end if;
+--end;
+--$code$
+--language plpgsql;
 
 --create or replace function ldg.get_proposed_block_at_height(height bigint) returns uuid as
 --$code$
@@ -349,6 +351,42 @@ language plpgsql;
 --end;
 --$code$
 --language plpgsql;
+
+--create or replace procedure ldg.apply_proposed_block(block_uuid uuid) as 
+--$code$
+--declare
+--    r record;
+--begin
+--    insert into ldg.ldg(uuid, height, payload) select uuid, height, block from ldg.proposed_block pb where pb.uuid=block_uuid and (pb.height=0 or exists(select * from ldg.ldg l1 where l1.height=pb.height-1))
+--        on conflict do nothing;
+--    if not found then
+--        for r in select conn_str from gsp.peer order by connected_at desc loop
+--            begin
+--                insert into ldg.ldg(uuid, height, payload) 
+--                    select (ldg).* 
+--                      from dblink.dblink(r.conn_str,
+--                          format('select ldg from ldg.ldg where uuid=%L', block_uuid)) as ldg(ldg ldg.ldg)
+--                      where exists(select * from ldg.ldg l1 where l1.height=(ldg.ldg).height-1)
+--                  on conflict do nothing;
+--                if not found then
+--                    continue;
+--                end if;
+--                delete from ldg.txpool where txpool.uuid in(select (p.block->>'uuid')::uuid from ldg.ldg pb, unnest(pb.payload) as p(block) where pb.uuid=block_uuid);
+--                delete from ldg.proposed_block as pba where pba.height<=(select pb.height from ldg.ldg pb where pb.uuid=block_uuid);
+--            exception
+--                when sqlstate '08000' then continue;
+--            end;
+--        end loop;
+--    else
+--        delete from ldg.txpool where txpool.uuid in(select (p.block->>'uuid')::uuid from ldg.proposed_block pb, unnest(pb.block) as p(block) where pb.uuid=block_uuid);
+--        delete from ldg.proposed_block as pba where pba.height<=(select pb.height from ldg.proposed_block pb where pb.uuid=block_uuid);
+--    end if;
+--end;
+--$code$
+--language plpgsql;
+
+--call ldg.apply_proposed_block('0189d9ae-aabe-7aa7-80d9-1888e19e27c5');
+--delete from ldg.proposed_block
 
 ------------------------------------------------------------------
          $sql2script$::text);
