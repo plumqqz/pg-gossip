@@ -297,30 +297,42 @@ call exec_at_all_hosts($sql2script$
 --  unique(peer_name, height)
 --);
 
---
---create or replace procedure ldg.make_proposed_block(height bigint) as
+
+create or replace procedure ldg.make_proposed_block() as
+$code$
+<<code>>
+declare
+  p_b ldg.proposed_block;
+  self gsp.self;
+  height bigint = coalesce((select max(height) from ldg.ldg),0);
+begin
+    select * into self from gsp.self;
+    if not found then return; end if;
+    if not ldg.is_ready() or exists(select * from ldg.proposed_block pb where pb.peer_name=self.name and pb.height=code.height)
+    then
+        return;
+    end if;
+    if exists(select * from ldg.ldg where ldg.height>=code.height) then
+        return;
+    end if;
+    p_b.uuid=gsp.gen_v7_uuid();
+    p_b.peer_name = (select name from gsp.self);
+    p_b.height = height;
+    p_b.block = array(select payload from ldg.txpool order by uuid limit 1000);
+    raise notice 'Propose block from % height %', self.name, height;
+    perform gsp.gossip('proposed-blocks', row_to_json(p_b));
+end;
+$code$
+language plpgsql;
+
+--create or replace function ldg.get_proposed_block_at_height(height bigint) returns uuid as
 --$code$
---<<code>>
---declare
---  p_b ldg.proposed_block;
---  self gsp.self;
 --begin
---    select * into self from gsp.self;
---    if not found then return; end if;
---    if not ldg.is_ready() or exists(select * from ldg.proposed_block pb where pb.peer_name=self.name and pb.height=make_proposed_block.height)
---    then
---        return;
---    end if;
---    p_b.uuid=gsp.gen_v7_uuid();
---    p_b.peer_name = (select name from gsp.self);
---    p_b.height = height;
---    p_b.block = array(select payload from ldg.txpool order by uuid limit 1000);
---    raise notice 'Propose block from % height %', self.name, height;
---    perform gsp.gossip('proposed-blocks', row_to_json(p_b));
+--    return (select pb.uuid from ldg.proposed_block pb, gsp.self where pb.height=get_proposed_block_at_height.height and pb.peer_name<>self.name limit 1);
 --end;
 --$code$
 --language plpgsql;
---
+
 --insert into gsp.mapping values('proposed-blocks', 'ldg.handle_proposed_block');
 --
 --create or replace function ldg.handle_proposed_block(uuid uuid, payload json) returns void as
