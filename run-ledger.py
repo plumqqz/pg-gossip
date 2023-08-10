@@ -1,3 +1,4 @@
+import json
 import pprint
 import time
 
@@ -9,6 +10,8 @@ import requests
 import base64
 import re
 import logging
+
+import urllib3.exceptions
 
 
 def etcd_url():
@@ -30,7 +33,11 @@ es = concurrent.futures.ThreadPoolExecutor(max_workers=20)
 
 cns = psycopg2.pool.ThreadedConnectionPool(1,20, **conn_dict)
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(name)s %(levelname)s:%(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s:%(message)s')
+
+urllib_logger = logging.getLogger('urllib3.connectionpool')
+urllib_logger.setLevel(logging.ERROR)
+
 
 def do_work():
     log=logging.getLogger("do_work")
@@ -93,29 +100,26 @@ def get_etcd_height():
     log.info("Start get_etcd_height")
 
     while True:
-        reply = requests.post(etcd_url()+"/kv/range", json={
+        success, json, timeout, errmsg = query_etcd("/kv/range", {
             "key": base64.standard_b64encode(ldg_prefix().encode()).decode(),
             "range_end": base64.b64encode(ldg_range_end().encode("ascii")).decode(),
             "sort_order": "DESCEND",
             "limit":"1"
         })
 
-        try:
-            if reply.json().get("kvs")!=None and len(reply.json().get("kvs"))>0:
-                height = base64.standard_b64decode(reply.json()["kvs"][0]["key"]).decode()
-                height=re.sub("/ldg/0*","", height)
-                height=int(height)
-                log.debug("Current etcd height is %s"%(height,))
-            else:
-                height=0
-                log.info("Got empty kvs field in etcd reply, assuming height=0")
-        except KeyError as ex:
-            logging.warning("Cannot find kvs key in reply")
-            time.sleep(30)
+        if not success:
+            log.warning(errmsg)
+            time.sleep(timeout)
             continue
-        except IndexError as ex:
-            logging.warning("Cannot find 0 index in kvs key in reply")
-            time.sleep(30)
+
+        if json.get("kvs")!=None and len(json.get("kvs"))>0:
+            height = base64.standard_b64decode(json["kvs"][0]["key"]).decode()
+            height=re.sub("/ldg/0*","", height)
+            height=int(height)
+            log.debug("Current etcd height is %s"%(height,))
+        else:
+            log.info("Got empty kvs field in etcd reply, assuming height=0")
+            height=0
 
         cn: psycopg2.connection = cns.getconn()
         old_autocommit=cn.autocommit
@@ -134,6 +138,29 @@ def get_etcd_height():
 
         time.sleep(15)
 
+def query_etcd(suburl:str, js:dict):
+    log = logging.getLogger("query_etcd")
+    try:
+        reply = requests.post(etcd_url()+suburl, json=js)
+        reply_json = reply.json()
+        log.debug("Json:%s" % reply_json)
+        if reply_json.get("kvs")!=None and len(reply_json.get("kvs"))>0:
+            return True, reply_json, 0, None
+        else:
+            return True, None, 0, None
+    except KeyError as ex:
+        msg = "Cannot find kvs key in reply"
+        log.warning(msg)
+        return False, None, 30, msg
+    except IndexError as ex:
+        msg = "Cannot find 0 index in kvs key in reply"
+        log.warning(msg)
+        return False, None, 30, msg
+    except (requests.exceptions.RequestException, json.decoder.JSONDecodeError) as ex:
+        msg = "Connection or parsing error:" + str(ex)
+        logging.warning(msg)
+        return False, None, 30, msg
+
 
 def put_proposed_block_to_etcd():
     log=logging.getLogger("put_proposed_block_to_etcd")
@@ -142,27 +169,23 @@ def put_proposed_block_to_etcd():
         old_autocommit=cn.autocommit
         cn.autocommit=True
         try:
-            try:
-                reply = requests.post(etcd_url()+"/kv/range", json={
+            success, json, timeout, errmsg = query_etcd("/kv/range", {
                     "key": base64.standard_b64encode(ldg_prefix().encode()).decode(),
                     "range_end": base64.b64encode(ldg_range_end().encode("ascii")).decode(),
                     "sort_order": "DESCEND",
                     "limit":"1"
                 })
-                log.debug("Json:%s"%reply.json())
-                if reply=="null":
-                    height=0
-                else:
-                    height = base64.standard_b64decode(reply.json()["kvs"][0]["key"]).decode()
-                    height = int(re.sub(ldg_prefix()+"0+","", height))
+            if not success:
+                log.warning(errmsg)
+                time.sleep(timeout)
+                continue
 
-                log.debug("Etcd height is %s"%(height))
-            except KeyError as ex:
-                log.warning("Cannot find kvs key in reply")
-                return
-            except IndexError as ex:
-                log.warning("Cannot find 0 index in kvs key in reply")
-                return
+            if json.get("kvs")!=None and len(json.get("kvs"))>0:
+                height = base64.standard_b64decode(json["kvs"][0]["key"]).decode()
+                height = int(re.sub(ldg_prefix()+"0+","", height))
+            else:
+                height=0
+
 
             with cn.cursor() as cr:
                 cr.execute("select coalesce(max(height),0) from ldg.ldg")
@@ -191,6 +214,7 @@ def put_proposed_block_to_etcd():
 
                 with cn.cursor() as cr:
                     cr.execute("call ldg.apply_proposed_block(%s)", (block_uuid,))
+                    log.info("Block %s at height %s has been applied", block_uuid, ch)
 
             with cn.cursor() as cr:
                 cr.execute("call ldg.make_proposed_block()")
@@ -198,7 +222,7 @@ def put_proposed_block_to_etcd():
                 new_block_uuid=cr.fetchone()[0]
                 if new_block_uuid==None:
                     log.debug("Cannot build a new block at height %s"%(height+1))
-                    time.sleep(1)
+                    time.sleep(5)
                     continue
 
                 log.debug("New block uuid=%s"%(new_block_uuid))
