@@ -6,9 +6,13 @@ call exec_at_all_hosts($sql2script$
 --create table gsp.self(id int primary key default 1 check(id=1), 
 --    name varchar(64) not null check (name~'^[a-zA-Z][A-Za-z0-9]*$'),
 --    group_name text not null default 'default',
---    conn_str text
+--    conn_str text,
 --);
---
+
+--create table ldg.etcd(id int primary key default 1 check(id=1),
+--height bigint,
+--connected_at timestamptz);
+
 --CREATE OR REPLACE FUNCTION gsp.gen_v7_uuid()
 -- RETURNS uuid
 -- LANGUAGE plpgsql
@@ -60,19 +64,17 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
---
+
+
 --create or replace procedure gsp.clear_gsp() as
 --$code$
 --begin
---    delete from gsp.gsp where not exists(select * from gsp.peer_gsp pg where gsp.uuid=pg.gsp_uuid) and gsp.uuid<gsp.gen_v7_uuid(now()::timestamp-make_interval(hours:=2))
---        and gsp.uuid<>(select uuid from gsp.gsp order by uuid desc limit 1);
+--    delete from gsp.gsp where not exists(select * from gsp.peer_gsp pg where gsp.uuid=pg.gsp_uuid) and gsp.uuid<gsp.gen_v7_uuid(now()::timestamp-make_interval(hours:=2));
 --end;
 --$code$
 --language plpgsql;
---
---
---
---
+
+
 --create table gsp.gsp(
 -- uuid uuid primary key,
 -- topic varchar(64) not null,
