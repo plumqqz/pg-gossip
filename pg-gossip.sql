@@ -4,8 +4,8 @@ call exec_at_all_hosts($sql2script$
 --create extension if not exists dblink with schema dblink;
 --create schema gsp;
 --create table gsp.self(id int primary key default 1 check(id=1), 
---    name varchar(64) not null check (name~'^[a-zA-Z][A-Za-z0-9]*$'),
---    group_name text not null default 'default',
+--    name varchar(64) not null check (name~'^[a-zA-Z][A-Za-z0-9]{,32}$'),
+--    group_name text not null default 'default' check (group_name~'^[a-zA-Z][A-Za-z0-9]{,32}$'),
 --    conn_str text,
 --);
 
@@ -77,23 +77,23 @@ call exec_at_all_hosts($sql2script$
 
 --create table gsp.gsp(
 -- uuid uuid primary key,
--- topic varchar(64) not null,
+-- topic varchar(64) not null check (topic ~ '^[a-zA-Z_][-_a-zA-Z0-9]{,64}$'),
 -- payload json
 --);
 --
 --create table gsp.peer(
--- name varchar(64) primary key check (name ~ '^[a-zA-Z][a-zA-Z0-9]*$'),
+-- name varchar(64) primary key check (name ~ '^[a-zA-Z][][-_a-zA-Z0-9]{,32}$'),
 -- conn_str text not null,
 -- connected_at timestamptz
 --);
 --
 --create table gsp.peer_gsp(
---    peer_name varchar(64) references gsp.peer(name),
+--    peer_name varchar(64) references gsp.peer(name) check (peer_name ~ '^[a-zA-Z][-_a-zA-Z0-9]{,32}$'),
 --    gsp_uuid uuid not null references gsp.gsp(uuid)
 --);
 --
 --create table gsp.mapping(
--- topic varchar(64) primary key,
+-- topic varchar(64) primary key check (topic ~ '^[a-zA-Z_][-_a-zA-Z0-9]{,64}$'),
 -- handler text not null
 --);
 --
@@ -107,7 +107,7 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
---         
+
 --create or replace function gsp.i_have(gsps uuid[]) returns table(uuid uuid) as 
 --$code$
 --begin
@@ -119,7 +119,7 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
---
+
 --create or replace function gsp.send_gsp(gsps gsp.gsp[]) returns text as
 --$code$
 --declare
@@ -134,7 +134,7 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
---
+
 --create or replace function gsp.gossip(topic text, payload json) returns uuid as
 --$code$
 --declare
@@ -190,7 +190,6 @@ call exec_at_all_hosts($sql2script$
 --begin
 --    while true loop
 --        begin
---            raise notice 'Sending gossips';
 --            cnt=gsp.spread_gossips(peer);
 --            ok = true;
 --        exception
@@ -386,9 +385,6 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
-
---call ldg.apply_proposed_block('0189d9ae-aabe-7aa7-80d9-1888e19e27c5');
---delete from ldg.proposed_block
 
 ------------------------------------------------------------------
          $sql2script$::text);

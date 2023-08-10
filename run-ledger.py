@@ -131,6 +131,7 @@ def get_etcd_height():
                 insert into ldg.etcd(height,connected_at) values(%s,now()) 
                     on conflict(id) do update set height=excluded.height, connected_at=now()
                 """, (height,))
+                cr.execute("delete from ldg.proposed_block pb where height<=%s", (height,))
             log.debug("DB updated with current etcd height")
         finally:
             cn.autocommit=old_autocommit
@@ -194,20 +195,26 @@ def put_proposed_block_to_etcd():
 
             for ch in range(int(my_height)+1, int(height)+1):
                 log.debug("     Working with height %s"%(ch))
-                key64 = ldg_prefix()+"%015d"%ch
 
-                reply = requests.post(etcd_url()+"/kv/range", json={
-                    "key": base64.standard_b64encode((ldg_prefix()+"%015d"%ch).encode()).decode()
-                })
+                try:
+                    reply = requests.post(etcd_url()+"/kv/range", json={
+                        "key": base64.standard_b64encode((ldg_prefix()+"%015d"%ch).encode()).decode()
+                    })
+                    if reply=="null":
+                        log.error("Unexpected reply when trying to get id of block at height %s"%(ch))
+                        return
+                    reply_json : dict = reply.json()
+                except (requests.exceptions.RequestException, json.decoder.JSONDecodeError) as ex:
+                    msg = "Connection or parsing error:" + str(ex)
+                    logging.warning(msg)
+                    time.sleep(10)
+                    continue
 
-                if reply=="null":
-                    log.error("Unexpected reply when trying to get id of block at height %s"%(ch))
-                    return
 
-                reply_json : dict = reply.json()
                 if reply_json.get("kvs")==None:
-                    log.critical("Get empty kvs for page defined in etcd")
-                    break
+                    msg = "Get empty kvs for page defined in etcd"
+                    log.critical(msg)
+                    raise Exception(msg)
 
                 block_uuid = base64.standard_b64decode(reply_json["kvs"][0]["value"]).decode()
                 log.debug("Block uuid=%s"%(block_uuid))
@@ -220,6 +227,7 @@ def put_proposed_block_to_etcd():
                 cr.execute("call ldg.make_proposed_block()")
                 cr.execute("select ldg.get_proposed_block_at_height(%s)"%(height+1))
                 new_block_uuid=cr.fetchone()[0]
+
                 if new_block_uuid==None:
                     log.debug("Cannot build a new block at height %s"%(height+1))
                     time.sleep(5)
@@ -230,7 +238,7 @@ def put_proposed_block_to_etcd():
             #{"compare":[{"createRevision":"0","target":"CREATE","key":"$key64"}],"success":[{"requestPut":{"key":"$key64","value":"$block_uuid_b64"}}]}
             height_key = base64.standard_b64encode((ldg_prefix() + "%015d" % (height + 1)).encode()).decode()
             new_block_uuid_b64 = base64.standard_b64encode(str(new_block_uuid).encode()).decode()
-            log.error("new height:%d height_key=%s block_uuid:%s"%(height+1, height_key, new_block_uuid_b64))
+            log.error("new height:%d height_key=%s block_uuid:%s"%(height+1, height, new_block_uuid))
             requests.post(etcd_url()+"/kv/txn", json={
                 "compare": [{
                     "createRevision":"0",
