@@ -230,7 +230,7 @@ def put_proposed_block_to_etcd():
 
                 if new_block_uuid==None:
                     log.debug("Cannot build a new block at height %s"%(height+1))
-                    time.sleep(5)
+                    time.sleep(0.2)
                     continue
 
                 log.debug("New block uuid=%s"%(new_block_uuid))
@@ -260,7 +260,7 @@ def put_proposed_block_to_etcd():
                 cns.putconn(cn)
 
         logging.debug("Block is sent")
-        time.sleep(1)
+
 
 def clear_gsp():
     while True:

@@ -69,7 +69,7 @@ call exec_at_all_hosts($sql2script$
 --create or replace procedure gsp.clear_gsp() as
 --$code$
 --begin
---    delete from gsp.gsp where not exists(select * from gsp.peer_gsp pg where gsp.uuid=pg.gsp_uuid) and gsp.uuid<gsp.gen_v7_uuid(now()::timestamp-make_interval(hours:=2));
+--    delete from gsp.gsp where not exists(select * from gsp.peer_gsp pg where gsp.uuid=pg.gsp_uuid) and gsp.uuid<gsp.gen_v7_uuid(now()::timestamp-make_interval(hours:=12));
 --end;
 --$code$
 --language plpgsql;
@@ -77,23 +77,23 @@ call exec_at_all_hosts($sql2script$
 
 --create table gsp.gsp(
 -- uuid uuid primary key,
--- topic varchar(64) not null check (topic ~ '^[a-zA-Z_][-_a-zA-Z0-9]{,64}$'),
+-- topic varchar(64) not null check (topic ~ '^[a-zA-Z_][-_a-zA-Z0-9]*$'),
 -- payload json
 --);
 --
 --create table gsp.peer(
--- name varchar(64) primary key check (name ~ '^[a-zA-Z][][-_a-zA-Z0-9]{,32}$'),
+-- name varchar(64) primary key check (name ~ '^[a-zA-Z][-_a-zA-Z0-9]*$'),
 -- conn_str text not null,
 -- connected_at timestamptz
 --);
 --
 --create table gsp.peer_gsp(
---    peer_name varchar(64) references gsp.peer(name) check (peer_name ~ '^[a-zA-Z][-_a-zA-Z0-9]{,32}$'),
+--    peer_name varchar(64) references gsp.peer(name) check (peer_name ~ '^[a-zA-Z][-_a-zA-Z0-9]*$'),
 --    gsp_uuid uuid not null references gsp.gsp(uuid)
 --);
 --
 --create table gsp.mapping(
--- topic varchar(64) primary key check (topic ~ '^[a-zA-Z_][-_a-zA-Z0-9]{,64}$'),
+-- topic varchar(64) primary key check (topic ~ '^[a-zA-Z_][-_a-zA-Z0-9]*$'),
 -- handler text not null
 --);
 --
@@ -126,7 +126,7 @@ call exec_at_all_hosts($sql2script$
 --    r record;
 --begin
 --    insert into gsp.gsp select gsps.* from unnest(gsps) as gsps on conflict do nothing;
---    insert into gsp.peer_gsp select p.name, gsps.uuid from gsp.peer p, unnest(gsps) as gsps on conflict do nothing;
+--    insert into gsp.peer_gsp select p.name, gsps.uuid from gsp.peer p, unnest(gsps) as gsps on conflict do nothing;      
 --    for r in select gsp.*, m.* from unnest(gsps) as gsp, gsp.mapping m where m.topic like gsp.topic loop
 --        execute format('select %s($1, $2)', r.handler) using r.uuid, r.payload;
 --    end loop;
@@ -322,7 +322,8 @@ call exec_at_all_hosts($sql2script$
 --    p_b.uuid=gsp.gen_v7_uuid();
 --    p_b.peer_name = (select name from gsp.self);
 --    p_b.height = height;
---    p_b.block = array(select json_build_object('uuid', txpool.uuid, 'payload', txpool.payload) from ldg.txpool order by uuid limit 1000);
+--    p_b.block = array(select json_build_object('uuid', txpool.uuid, 'payload', txpool.payload) from ldg.txpool 
+--                where not exists(select * from ldg.ldg where ldg.expand_ldg_payload_uuids(ldg)@>array[txpool.uuid]) order by uuid limit 64*10);
 --    raise notice 'Propose block from % height %', self.name, height;
 --    if cardinality(p_b.block)>0 then
 --        perform gsp.gossip('proposed-blocks', row_to_json(p_b));
@@ -360,6 +361,7 @@ call exec_at_all_hosts($sql2script$
 --$code$
 --declare
 --    r record;
+--    nh bigint;
 --begin
 --    insert into ldg.ldg(uuid, height, payload) select uuid, height, block from ldg.proposed_block pb where pb.uuid=block_uuid and (pb.height=0 or exists(select * from ldg.ldg l1 where l1.height=pb.height-1))
 --        on conflict do nothing;
@@ -371,19 +373,20 @@ call exec_at_all_hosts($sql2script$
 --                      from dblink.dblink(r.conn_str,
 --                          format('select ldg from ldg.ldg where uuid=%L', block_uuid)) as ldg(ldg ldg.ldg)
 --                      where exists(select * from ldg.ldg l1 where l1.height=(ldg.ldg).height-1)
---                  on conflict do nothing;
+--                  on conflict do nothing
+--                  returning height into nh;
 --                if not found then
 --                    continue;
 --                end if;
---                delete from ldg.txpool where txpool.uuid in(select (p.block->>'uuid')::uuid from ldg.ldg pb, unnest(pb.payload) as p(block) where pb.uuid=block_uuid);
---                delete from ldg.proposed_block as pba where pba.height<=(select pb.height from ldg.ldg pb where pb.uuid=block_uuid);
+--                delete from ldg.txpool where txpool.uuid in(select (p.block->>'uuid')::uuid from ldg.ldg pb, unnest(pb.payload) as p(block) where pb.height=nh);
+--                delete from ldg.proposed_block as pba where pba.height<nh;
 --            exception
 --                when sqlstate '08000' then continue;
 --            end;
 --        end loop;
 --    else
 --        delete from ldg.txpool where txpool.uuid in(select (p.block->>'uuid')::uuid from ldg.proposed_block pb, unnest(pb.block) as p(block) where pb.uuid=block_uuid);
---        delete from ldg.proposed_block as pba where pba.height<=(select pb.height from ldg.proposed_block pb where pb.uuid=block_uuid);
+--        delete from ldg.proposed_block as pba where pba.height<(select pb.height from ldg.proposed_block pb where pb.uuid=block_uuid);
 --    end if;
 --end;
 --$code$
