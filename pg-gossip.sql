@@ -196,6 +196,9 @@ call exec_at_all_hosts($sql2script$
 --            when sqlstate '08000' then
 --                ok = false;
 --                raise notice 'Connection problems:%', sqlerrm;
+--            when deadlock_detected then
+--                ok = false;
+--                raise notice 'Deadlock detected';
 --        end;
 --        if ok then
 --            commit;
@@ -386,5 +389,14 @@ call exec_at_all_hosts($sql2script$
 --$code$
 --language plpgsql;
 
+--create or replace function ldg.expand_ldg_payload_uuids(ldg ldg.ldg) returns uuid[] as
+--$code$
+--  select array_agg((uo->>'uuid')::uuid) from (select ldg.*) ldg, unnest(ldg.payload) as uo
+--$code$
+--language sql
+--immutable
+--parallel safe;
+
+--create index on ldg.ldg using gin((ldg.expand_ldg_payload_uuids(ldg)))
 ------------------------------------------------------------------
          $sql2script$::text);
