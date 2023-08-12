@@ -1,3 +1,4 @@
+-- CONNECTION: url=jdbc:postgresql://localhost:5432/work
 call exec_at_all_hosts($sql2script$
 --------------------------------------------------
 --create schema if not exists dblink;
@@ -70,6 +71,7 @@ call exec_at_all_hosts($sql2script$
 --$code$
 --begin
 --    delete from gsp.gsp where not exists(select * from gsp.peer_gsp pg where gsp.uuid=pg.gsp_uuid) and gsp.uuid<gsp.gen_v7_uuid(now()::timestamp-make_interval(hours:=12));
+--    commit;
 --end;
 --$code$
 --language plpgsql;
@@ -324,7 +326,6 @@ call exec_at_all_hosts($sql2script$
 --    p_b.height = height;
 --    p_b.block = array(select json_build_object('uuid', txpool.uuid, 'payload', txpool.payload) from ldg.txpool 
 --                where not exists(select * from ldg.ldg where ldg.expand_ldg_payload_uuids(ldg)@>array[txpool.uuid]) order by uuid limit 64*10);
---    raise notice 'Propose block from % height %', self.name, height;
 --    if cardinality(p_b.block)>0 then
 --        perform gsp.gossip('proposed-blocks', row_to_json(p_b));
 --    end if;
@@ -401,5 +402,15 @@ call exec_at_all_hosts($sql2script$
 --parallel safe;
 
 --create index on ldg.ldg using gin((ldg.expand_ldg_payload_uuids(ldg)))
+
+--create or replace procedure ldg.clear_txpool() as
+--$code$
+--begin
+--    delete from ldg.txpool 
+--        where exists(select * from ldg.ldg where ldg.expand_ldg_payload_uuids(ldg)@>array[txpool.uuid]);
+--    commit;
+--end;
+--$code$
+--language plpgsql;
 ------------------------------------------------------------------
          $sql2script$::text);
