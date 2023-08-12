@@ -36,7 +36,7 @@ es = concurrent.futures.ThreadPoolExecutor(max_workers=20)
 
 cns = psycopg2.pool.ThreadedConnectionPool(15,20, **conn_dict)
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name).16s: %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(name).16s: %(message)s')
 
 urllib_logger = logging.getLogger('urllib3.connectionpool')
 urllib_logger.setLevel(logging.ERROR)
@@ -79,8 +79,8 @@ def handle_peer(peer):
             cr.execute("call gsp.constantly_spread_gossips(%s)", [peer])
             cr.fetchall()
     except BaseException as ex:
-        print(type(ex).__name__+":"+str(ex))
-        stop_all()
+        log.error("Exception %s", ex)
+        raise ex
     finally:
         cns.putconn(cn)
 
@@ -95,7 +95,8 @@ def gossip_my_height():
             cr.execute("call ldg.constantly_gossip_my_height()")
             cr.fetchall()
     except BaseException as ex:
-        stop_all()
+        log.error("Exception %s", ex)
+        raise ex
     finally:
         cns.putconn(cn)
 
@@ -137,6 +138,9 @@ def get_etcd_height():
                 """, (height,))
                 cr.execute("delete from ldg.proposed_block pb where height<=%s", (height,))
             log.debug("DB updated with current etcd height")
+        except BaseException as ex:
+            log.error("Exception %s", ex)
+            raise ex
         finally:
             cn.autocommit=old_autocommit
             cns.putconn(cn)
@@ -241,7 +245,7 @@ def put_proposed_block_to_etcd():
                 new_block_uuid=cr.fetchone()[0]
                 log.debug("New block uuid received:%s", new_block_uuid)
 
-                if new_block_uuid==None:
+                if new_block_uuid==None or new_block_uuid=="None":
                     log.debug("Cannot build a new block at height %s"%(height+1))
                     if idle_sleep<10:
                         idle_sleep+=0.05
@@ -253,7 +257,7 @@ def put_proposed_block_to_etcd():
             #{"compare":[{"createRevision":"0","target":"CREATE","key":"$key64"}],"success":[{"requestPut":{"key":"$key64","value":"$block_uuid_b64"}}]}
             height_key = base64.standard_b64encode((ldg_prefix() + "%015d" % (height + 1)).encode()).decode()
             new_block_uuid_b64 = base64.standard_b64encode(str(new_block_uuid).encode()).decode()
-            log.debug("Going to execute txn in etcd; new height:%d height_key=%s block_uuid:%s"%(height+1, height, new_block_uuid))
+            log.info("Going to execute txn in etcd; new height:%d height_key=%s block_uuid:%s"%(height+1, height, new_block_uuid))
             requests.post(etcd_url()+"/kv/txn", json={
                 "compare": [{
                     "createRevision":"0",
@@ -269,10 +273,10 @@ def put_proposed_block_to_etcd():
             })
             log.debug("txn executed")
 
-        except OperationalError as ex:
-            if ex.pgcode.startswith('08'):
-                need_for_sleep=10
-                continue
+        except BaseException as ex:
+            log.error("Exception %s", ex)
+            raise ex
+
         finally:
             if cn!=None:
                 log.debug("Returning connection")
