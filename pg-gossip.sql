@@ -12,7 +12,12 @@ call exec_at_all_hosts($sql2script$
 
 --create table ldg.etcd(id int primary key default 1 check(id=1),
 --height bigint,
---connected_at timestamptz);
+--connected_at timestamptz,
+-- cluster_id text not null);
+
+--alter table ldg.etcd add cluster_id text;
+--update ldg.etcd set cluster_id='14841639068965178418';
+--alter table ldg.etcd alter cluster_id drop not null;
 
 --CREATE OR REPLACE FUNCTION gsp.gen_v7_uuid()
 -- RETURNS uuid
@@ -181,7 +186,7 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
---
+
 
 
 --create or replace procedure gsp.constantly_spread_gossips(peer text) as 
@@ -195,9 +200,6 @@ call exec_at_all_hosts($sql2script$
 --            cnt=gsp.spread_gossips(peer);
 --            ok = true;
 --        exception
---            when sqlstate '08000' then
---                ok = false;
---                raise notice 'Connection problems:%', sqlerrm;
 --            when deadlock_detected then
 --                ok = false;
 --                raise notice 'Deadlock detected';
@@ -286,6 +288,17 @@ call exec_at_all_hosts($sql2script$
 --$code$
 --language plpgsql;
 --
+--create or replace procedure ldg.gossip_my_height() as 
+--$code$
+--begin
+--    perform gsp.gossip('peer-height',json_build_object('name',self.name,'height',coalesce(ldg.max_height,0), 'sent-at',clock_timestamp()))
+--        from gsp.self, (select max(height) as max_height from ldg.ldg) ldg;
+--    commit;
+--end;
+--$code$
+--language plpgsql;
+
+--
 --create or replace function ldg.is_ready() returns boolean as
 --$code$
 --begin
@@ -340,8 +353,8 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
-
---insert into gsp.mapping values('proposed-blocks', 'ldg.handle_proposed_block');
+--
+----insert into gsp.mapping values('proposed-blocks', 'ldg.handle_proposed_block');
 --
 --create or replace function ldg.handle_proposed_block(uuid uuid, payload json) returns void as
 --$code$
@@ -357,7 +370,7 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
-
+--
 --create or replace procedure ldg.apply_proposed_block(block_uuid uuid) as 
 --$code$
 --declare
