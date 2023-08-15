@@ -71,16 +71,15 @@ call exec_at_all_hosts($sql2script$
 --$code$
 --language plpgsql;
 
-
 --create or replace procedure gsp.clear_gsp() as
 --$code$
 --begin
---    delete from gsp.gsp where not exists(select * from gsp.peer_gsp pg where gsp.uuid=pg.gsp_uuid) and gsp.uuid<gsp.gen_v7_uuid(now()::timestamp-make_interval(hours:=12));
---    commit;
+--    delete from gsp.gsp where not exists(select * from gsp.peer_gsp pg where gsp.uuid=pg.gsp_uuid) and gsp.uuid<gsp.gen_v7_uuid(now() at time zone 'UTC'- make_interval(hours:=2));
 --end;
 --$code$
 --language plpgsql;
 
+--select gsp.gen_v7_uuid(now() at time zone 'UTC'- make_interval(hours:=2))
 
 --create table gsp.gsp(
 -- uuid uuid primary key,
@@ -98,6 +97,9 @@ call exec_at_all_hosts($sql2script$
 --    peer_name varchar(64) references gsp.peer(name) check (peer_name ~ '^[a-zA-Z][-_a-zA-Z0-9]*$'),
 --    gsp_uuid uuid not null references gsp.gsp(uuid)
 --);
+
+--create unique index on gsp.peer_gsp(peer_name,gsp_uuid);
+--create index on gsp.peer_gsp(gsp_uuid);
 --
 --create table gsp.mapping(
 -- topic varchar(64) primary key check (topic ~ '^[a-zA-Z_][-_a-zA-Z0-9]*$'),
@@ -152,7 +154,7 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
---
+
 --create or replace function gsp.spread_gossips(peer_name text) returns int as
 --$code$
 --declare
@@ -160,7 +162,7 @@ call exec_at_all_hosts($sql2script$
 --                        from gsp.peer_gsp pg 
 --                       where pg.peer_name=spread_gossips.peer_name
 --                         and pg.gsp_uuid>gsp.gen_v7_uuid(now()::timestamp-make_interval(days:=1))
---                    order by gsp_uuid for update skip locked limit 1000);
+--                    order by gsp_uuid for update skip locked limit 10000);
 --    sendme uuid[];
 --    conn_str text = (select p.conn_str from gsp.peer p where p.name=spread_gossips.peer_name);
 --    self gsp.self;
@@ -182,6 +184,7 @@ call exec_at_all_hosts($sql2script$
 --    end if;
 --    perform from dblink.dblink(conn_str,format('select gsp.send_gsp(%L::gsp.gsp[])', (select array_agg(gsp) from gsp.gsp where uuid=any(sendme)))) as rs(v text);
 --    delete from gsp.peer_gsp pg where pg.peer_name=spread_gossips.peer_name and pg.gsp_uuid=any(gsps);
+--    call gsp.clear_gsp();
 --    return cardinality(gsps);
 --end;
 --$code$
@@ -335,16 +338,18 @@ call exec_at_all_hosts($sql2script$
 --        return;
 --    end if;
 --    p_b.uuid=gsp.gen_v7_uuid();
---    p_b.peer_name = (select name from gsp.self);
+--    p_b.peer_name = self.name;
 --    p_b.height = height;
 --    p_b.block = array(select json_build_object('uuid', txpool.uuid, 'payload', txpool.payload) from ldg.txpool 
---                where not exists(select * from ldg.ldg where ldg.expand_ldg_payload_uuids(ldg)@>array[txpool.uuid]) order by uuid limit 64*10);
+--                where not exists(select * from ldg.ldg where ldg.expand_ldg_payload_uuids(ldg)@>array[txpool.uuid]) order by uuid limit 10000);
+--    raise notice 'list of txs has been built';
 --    if cardinality(p_b.block)>0 then
 --        perform gsp.gossip('proposed-blocks', row_to_json(p_b));
 --    end if;
 --end;
 --$code$
---language plpgsql;
+--language plpgsql
+--set enable_seqscan to off;
 
 --create or replace function ldg.get_proposed_block_at_height(height bigint) returns uuid as
 --$code$
@@ -370,7 +375,7 @@ call exec_at_all_hosts($sql2script$
 --end;
 --$code$
 --language plpgsql;
---
+
 --create or replace procedure ldg.apply_proposed_block(block_uuid uuid) as 
 --$code$
 --declare
@@ -391,9 +396,10 @@ call exec_at_all_hosts($sql2script$
 --                  returning height into nh;
 --                if not found then
 --                    continue;
+--                else
+--                    delete from ldg.txpool where txpool.uuid in(select (p.block->>'uuid')::uuid from ldg.ldg pb, unnest(pb.payload) as p(block) where pb.height=nh);
+--                    delete from ldg.proposed_block as pba where pba.height<nh;
 --                end if;
---                delete from ldg.txpool where txpool.uuid in(select (p.block->>'uuid')::uuid from ldg.ldg pb, unnest(pb.payload) as p(block) where pb.height=nh);
---                delete from ldg.proposed_block as pba where pba.height<nh;
 --            exception
 --                when sqlstate '08000' then continue;
 --            end;
@@ -412,7 +418,7 @@ call exec_at_all_hosts($sql2script$
 --$code$
 --language sql
 --immutable
---parallel safe;
+
 
 --create index on ldg.ldg using gin((ldg.expand_ldg_payload_uuids(ldg)))
 
@@ -421,9 +427,9 @@ call exec_at_all_hosts($sql2script$
 --begin
 --    delete from ldg.txpool 
 --        where exists(select * from ldg.ldg where ldg.expand_ldg_payload_uuids(ldg)@>array[txpool.uuid]);
---    commit;
 --end;
 --$code$
---language plpgsql;
+--language plpgsql
+--set enable_seqscan to off;
 ------------------------------------------------------------------
          $sql2script$::text);

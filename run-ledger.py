@@ -51,18 +51,21 @@ cns = psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=20, **conn_dict)
 
 @contextmanager
 def get_cn():
-    connection = cns.getconn()
+    cn = cns.getconn()
+    #cn = psycopg2.connect(**conn_dict)
+    cn.autocommit=True
     try:
-        yield connection
+        yield cn
     finally:
-        cns.putconn(connection)
+        cns.putconn(cn)
+        #cn.close()
 
 
 es = concurrent.futures.ThreadPoolExecutor(max_workers=20)
 
 stop_all = threading.Event()
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(name).16s: %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name).16s: %(message)s')
 
 urllib_logger = logging.getLogger('urllib3.connectionpool')
 urllib_logger.setLevel(logging.ERROR)
@@ -87,7 +90,7 @@ def main():
         futures.append(es.submit(clear_gsp))
         futures.append(es.submit(clear_txpool))
         log.info("All worker threads are added, will wait")
-        cn.close()
+
         es.shutdown()
         concurrent.futures.wait(futures, None, concurrent.futures.FIRST_EXCEPTION)
     except BaseException as ex:
@@ -105,7 +108,7 @@ def handle_peer(peer):
             with get_cn() as cn, cn.cursor() as cr:
                 log.debug("Starting peer %s", peer)
                 cr.execute("select gsp.spread_gossips(%s)", (peer,))
-                time.sleep(3)
+                time.sleep(1)
     except BaseException as ex:
         log.error("Exception %s", traceback.format_exc(100))
         stop_all.set()
@@ -246,7 +249,6 @@ def put_proposed_block_to_etcd():
 
     try:
         idle_sleep=0.05;
-        need_for_sleep=0;
 
         while True:
             if stop_all.isSet():
@@ -282,7 +284,7 @@ def put_proposed_block_to_etcd():
 
                 for ch in range(int(my_height+1), int(height)+1):
                     log.debug("     Working with height %s"%(ch))
-
+                    idle_sleep=0.2
                     try:
                         log.debug("Query etcd for uuid of block %s", ch)
                         reply = get_sess().post(etcd_url()+"/kv/range", json={
@@ -291,6 +293,7 @@ def put_proposed_block_to_etcd():
                         log.debug("Reply from etcd obtained")
                         if reply=="null":
                             log.error("Unexpected reply when trying to get id of block at height %s"%(ch))
+                            stop_all.set()
                             return
                         reply_json : dict = reply.json()
 
@@ -315,14 +318,13 @@ def put_proposed_block_to_etcd():
                         if block_uuid is None:
                             log.error("json:{}", reply_json)
 
-                        with cn.cursor() as cr:
+                        with get_cn() as cn, cn.cursor() as cr:
                             cn.autocommit=True
                             cr.execute("call ldg.apply_proposed_block(%s)", (block_uuid,))
                             log.info("Block %s at height %s has been applied", block_uuid, ch)
 
                 log.debug("Going to create proposed block")
                 with get_cn() as cn, cn.cursor() as cr:
-                    cn.autocommit=True
                     cr.execute("call ldg.make_proposed_block()")
                     log.debug("Call to ldg.make_proposed_block() is done")
 
@@ -333,7 +335,7 @@ def put_proposed_block_to_etcd():
 
                     if new_block_uuid is None:
                         log.debug("Cannot build a new block at height %s"%(height+1))
-                        if idle_sleep<10:
+                        if idle_sleep<3:
                             idle_sleep+=0.05
 
                         time.sleep(idle_sleep)
@@ -371,9 +373,6 @@ def put_proposed_block_to_etcd():
                 log.error("stack trace:", traceback.format_exception(exc_type, exc_value, exc_traceback))
                 return
 
-            if need_for_sleep>0:
-                time.sleep(need_for_sleep)
-                need_for_sleep=0
             logging.debug("Block is sent")
 
     except BaseException as ex:
@@ -388,10 +387,10 @@ def clear_gsp():
         while True:
             if stop_all.isSet():
                 return
-            if time.time()-last_run>=60:
+            if time.time()-last_run>=3:
                 with get_cn() as cn, cn.cursor() as cr:
-                    cn.autocommit=True
                     cr.execute("call gsp.clear_gsp()")
+                    log.debug("Clear gsp was executed")
                 last_run=time.time()
             time.sleep(1)
     except BaseException as ex:
@@ -407,10 +406,9 @@ def clear_txpool():
         while True:
             if stop_all.isSet():
                 return
-            if time.time()-last_run>=60:
+            if time.time()-last_run>=10:
                 with get_cn() as cn, cn.cursor() as cr:
-                    cn.autocommit=True
-                    cr.execute("call ldg.clear_txpool()")
+                    cr.execute("call ldg.clear_txpool();")
                 last_run=time.time()
             time.sleep(1)
     except BaseException as ex:
