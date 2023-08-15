@@ -60,8 +60,7 @@ CREATE PROCEDURE gsp.clear_gsp()
     LANGUAGE plpgsql
     AS $$
 begin
-    delete from gsp.gsp where not exists(select * from gsp.peer_gsp pg where gsp.uuid=pg.gsp_uuid) and gsp.uuid<gsp.gen_v7_uuid(now()::timestamp-make_interval(hours:=2))
-        and gsp.uuid<>(select uuid from gsp.gsp order by uuid desc limit 1);
+    delete from gsp.gsp where not exists(select * from gsp.peer_gsp pg where gsp.uuid=pg.gsp_uuid) and gsp.uuid<gsp.gen_v7_uuid(now() at time zone 'UTC'- make_interval(hours:=2));
 end;
 $$;
 
@@ -167,7 +166,7 @@ CREATE FUNCTION gsp.gossip(topic text, payload json) RETURNS uuid
 declare
  iuuid uuid = gsp.gen_v7_uuid();
 begin
-    perform gsp.send_gsp(array[(iuuid, topic, payload)::gsp.gsp]);
+    perform gsp.send_gsp(array[(iuuid, topic, payload, array(select name from gsp.self))::gsp.gsp]);
     return iuuid;
 end;
 $$;
@@ -223,7 +222,8 @@ SET default_table_access_method = heap;
 CREATE TABLE gsp.gsp (
     uuid uuid NOT NULL,
     topic character varying(64) NOT NULL,
-    payload json
+    payload json,
+    seenby text[] DEFAULT ARRAY[]::text[] NOT NULL
 );
 
 
@@ -239,8 +239,8 @@ CREATE FUNCTION gsp.send_gsp(gsps gsp.gsp[]) RETURNS text
 declare
     r record;
 begin
-    insert into gsp.gsp select gsps.* from unnest(gsps) as gsps on conflict do nothing;
-    insert into gsp.peer_gsp select p.name, gsps.uuid from gsp.peer p, unnest(gsps) as gsps on conflict do nothing;      
+    insert into gsp.gsp select gsps.uuid, gsps.topic, gsps.payload, gsps.seenby || self.name from unnest(gsps) as gsps, gsp.self on conflict do nothing;
+    insert into gsp.peer_gsp select p.name, gsps.uuid from gsp.peer p, unnest(gsps) as gsps where p.name<>all(gsps.seenby) on conflict do nothing;      
     for r in select gsp.*, m.* from unnest(gsps) as gsp, gsp.mapping m where m.topic like gsp.topic loop
         execute format('select %s($1, $2)', r.handler) using r.uuid, r.payload;
     end loop;
@@ -257,13 +257,14 @@ ALTER FUNCTION gsp.send_gsp(gsps gsp.gsp[]) OWNER TO postgres;
 
 CREATE FUNCTION gsp.spread_gossips(peer_name text) RETURNS integer
     LANGUAGE plpgsql
+    SET enable_seqscan TO 'false'
     AS $_$
 declare
     gsps uuid[]=array(select pg.gsp_uuid 
                         from gsp.peer_gsp pg 
                        where pg.peer_name=spread_gossips.peer_name
                          and pg.gsp_uuid>gsp.gen_v7_uuid(now()::timestamp-make_interval(days:=1))
-                    order by gsp_uuid for update skip locked limit 1000);
+                    order by gsp_uuid for update skip locked limit 10000);
     sendme uuid[];
     conn_str text = (select p.conn_str from gsp.peer p where p.name=spread_gossips.peer_name);
     self gsp.self;
@@ -285,6 +286,7 @@ begin
     end if;
     perform from dblink.dblink(conn_str,format('select gsp.send_gsp(%L::gsp.gsp[])', (select array_agg(gsp) from gsp.gsp where uuid=any(sendme)))) as rs(v text);
     delete from gsp.peer_gsp pg where pg.peer_name=spread_gossips.peer_name and pg.gsp_uuid=any(gsps);
+    call gsp.clear_gsp();
     return cardinality(gsps);
 end;
 $_$;
@@ -298,6 +300,7 @@ ALTER FUNCTION gsp.spread_gossips(peer_name text) OWNER TO postgres;
 
 CREATE PROCEDURE ldg.apply_proposed_block(IN block_uuid uuid)
     LANGUAGE plpgsql
+    SET enable_seqscan TO 'off'
     AS $$
 declare
     r record;
@@ -317,9 +320,10 @@ begin
                   returning height into nh;
                 if not found then
                     continue;
+                else
+                    delete from ldg.txpool where txpool.uuid in(select (p.block->>'uuid')::uuid from ldg.ldg pb, unnest(pb.payload) as p(block) where pb.height=nh);
+                    delete from ldg.proposed_block as pba where pba.height<nh;
                 end if;
-                delete from ldg.txpool where txpool.uuid in(select (p.block->>'uuid')::uuid from ldg.ldg pb, unnest(pb.payload) as p(block) where pb.height=nh);
-                delete from ldg.proposed_block as pba where pba.height<nh;
             exception
                 when sqlstate '08000' then continue;
             end;
@@ -355,11 +359,11 @@ ALTER FUNCTION ldg.broadcast_tx(tx json) OWNER TO postgres;
 
 CREATE PROCEDURE ldg.clear_txpool()
     LANGUAGE plpgsql
+    SET enable_seqscan TO 'off'
     AS $$
 begin
     delete from ldg.txpool 
         where exists(select * from ldg.ldg where ldg.expand_ldg_payload_uuids(ldg)@>array[txpool.uuid]);
-    commit;
 end;
 $$;
 
@@ -406,7 +410,7 @@ ALTER TABLE ldg.ldg OWNER TO postgres;
 --
 
 CREATE FUNCTION ldg.expand_ldg_payload_uuids(ldg ldg.ldg) RETURNS uuid[]
-    LANGUAGE sql IMMUTABLE PARALLEL SAFE
+    LANGUAGE sql IMMUTABLE
     AS $$
   select array_agg((uo->>'uuid')::uuid) from (select ldg.*) ldg, unnest(ldg.payload) as uo
 $$;
@@ -520,6 +524,7 @@ ALTER FUNCTION ldg.is_ready() OWNER TO postgres;
 
 CREATE PROCEDURE ldg.make_proposed_block()
     LANGUAGE plpgsql
+    SET enable_seqscan TO 'off'
     AS $$
 <<code>>
 declare
@@ -537,10 +542,11 @@ begin
         return;
     end if;
     p_b.uuid=gsp.gen_v7_uuid();
-    p_b.peer_name = (select name from gsp.self);
+    p_b.peer_name = self.name;
     p_b.height = height;
     p_b.block = array(select json_build_object('uuid', txpool.uuid, 'payload', txpool.payload) from ldg.txpool 
-                where not exists(select * from ldg.ldg where ldg.expand_ldg_payload_uuids(ldg)@>array[txpool.uuid]) order by uuid limit 64*10);
+                where not exists(select * from ldg.ldg where ldg.expand_ldg_payload_uuids(ldg)@>array[txpool.uuid]) order by uuid limit 10000);
+    raise notice 'list of txs has been built';
     if cardinality(p_b.block)>0 then
         perform gsp.gossip('proposed-blocks', row_to_json(p_b));
     end if;
@@ -767,6 +773,27 @@ ALTER TABLE ONLY ldg.proposed_block
 
 ALTER TABLE ONLY ldg.txpool
     ADD CONSTRAINT txpool_pkey PRIMARY KEY (uuid);
+
+
+--
+-- Name: peer_gsp_gsp_uuid_idx; Type: INDEX; Schema: gsp; Owner: postgres
+--
+
+CREATE INDEX peer_gsp_gsp_uuid_idx ON gsp.peer_gsp USING btree (gsp_uuid);
+
+
+--
+-- Name: peer_gsp_peer_name_gsp_uuid_idx; Type: INDEX; Schema: gsp; Owner: postgres
+--
+
+CREATE UNIQUE INDEX peer_gsp_peer_name_gsp_uuid_idx ON gsp.peer_gsp USING btree (peer_name, gsp_uuid);
+
+
+--
+-- Name: peer_gsp_peer_name_gsp_uuid_idx1; Type: INDEX; Schema: gsp; Owner: postgres
+--
+
+CREATE UNIQUE INDEX peer_gsp_peer_name_gsp_uuid_idx1 ON gsp.peer_gsp USING btree (peer_name, gsp_uuid);
 
 
 --
