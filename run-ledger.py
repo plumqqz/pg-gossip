@@ -8,11 +8,11 @@ import sys
 import threading
 import time
 
-import psycopg
-from psycopg_pool import ConnectionPool
+import psycopg2
+import psycopg2.pool
 import requests
 import traceback
-
+from contextlib import contextmanager
 
 def etcd_url():
     return "http://localhost:42379/v3"
@@ -35,7 +35,28 @@ if len(sys.argv)>1:
 else:
     raise "No connection string specified!"
 
-cns = ConnectionPool(sys.argv[1], min_size=1, max_size=20)
+
+def get_etcd_cluster_id():
+    log = logging.getLogger("get_etcd_cluster_id")
+    try:
+        return get_etcd_cluster_id.cluster_id
+    except AttributeError:
+        with get_cn() as cn, cn.cursor() as cr:
+            cr.execute("select cluster_id from ldg.etcd")
+            get_etcd_cluster_id.cluster_id=cr.fetchone()[0]
+            log.info("etcd cluster id=%s", get_etcd_cluster_id.cluster_id)
+            return get_etcd_cluster_id.cluster_id
+
+cns = psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=20, **conn_dict)
+
+@contextmanager
+def get_cn():
+    connection = cns.getconn()
+    try:
+        yield connection
+    finally:
+        cns.putconn(connection)
+
 
 es = concurrent.futures.ThreadPoolExecutor(max_workers=20)
 
@@ -48,10 +69,10 @@ urllib_logger.setLevel(logging.ERROR)
 
 
 def main():
-    log=logging.getLogger("do_work")
+    log=logging.getLogger("main")
     futures=[]
     try:
-        with cns.connection() as cn, cn.cursor() as cr:
+        with get_cn() as cn, cn.cursor() as cr:
             cn.autocommit=True
             cr.execute("select name from gsp.peer")
             res = cr.fetchall()
@@ -71,8 +92,8 @@ def main():
         concurrent.futures.wait(futures, None, concurrent.futures.FIRST_EXCEPTION)
     except BaseException as ex:
         stop_all.set()
-        log.error("Exception:%s"%ex)
-        sys.exit(1)
+        log.error("Exception:%s", str(ex))
+
 
 def handle_peer(peer):
     log=logging.getLogger("handle_peer")
@@ -81,29 +102,32 @@ def handle_peer(peer):
         while True:
             if stop_all.isSet():
                 return
-            with cns.connection() as cn, cn.cursor() as cr:
-                cn.autocommit=True
-                cr.execute("select gsp.spread_gossips(%s)", [peer])
+            with get_cn() as cn, cn.cursor() as cr:
+                log.debug("Starting peer %s", peer)
+                cr.execute("select gsp.spread_gossips(%s)", (peer,))
                 time.sleep(3)
     except BaseException as ex:
-        log.error("Exception %s", ex)
+        log.error("Exception %s", traceback.format_exc(100))
         stop_all.set()
         raise ex
 
 
 def gossip_my_height():
     log=logging.getLogger("gossip_my_height")
+    last_run=0
     try:
         log.info("Start gossip height")
         while True:
             if stop_all.isSet():
                 return
-            with cns.connection() as cn, cn.cursor() as cr:
-                cn.autocommit=True
-                cr.execute("call ldg.gossip_my_height()")
-            time.sleep(45)
+            if time.time()-last_run >=45:
+                with get_cn() as cn, cn.cursor() as cr:
+                    cn.autocommit=True
+                    cr.execute("call ldg.gossip_my_height()")
+                    last_run=time.time()
+            time.sleep(3)
     except BaseException as ex:
-        log.error("Exception %s", ex)
+        log.error("Exception %s", traceback.format_exc(100))
         stop_all.set()
         raise ex
 
@@ -128,7 +152,9 @@ def get_etcd_height():
                 time.sleep(timeout)
                 continue
 
-            cluster_id=json['header']['cluster_id']
+            if json['header']['cluster_id']!=get_etcd_cluster_id():
+                raise RuntimeError("Cluster id mismatch: expected %s, got %s"%(get_etcd_cluster_id(), json['header']['cluster_id']))
+
             if json.get("kvs")!=None and len(json.get("kvs"))>0:
                 height = base64.standard_b64decode(json["kvs"][0]["key"]).decode()
                 height=re.sub("/ldg/0*","", height)
@@ -139,11 +165,8 @@ def get_etcd_height():
                 height=0
 
             try:
-                with cns.connection() as cn, cn.cursor() as cr:
+                with get_cn() as cn, cn.cursor() as cr:
                     cn.autocommit=True
-                    cr.execute("select exists(select * from ldg.etcd where cluster_id=%s)", [cluster_id])
-                    if not cr.fetchone()[0]:
-                        raise RuntimeError("Unknown etcd cluster")
                     cr.execute("""
                     insert into ldg.etcd(height,connected_at) values(%s,now()) 
                         on conflict(id) do update set height=excluded.height, connected_at=now()
@@ -156,7 +179,7 @@ def get_etcd_height():
 
             time.sleep(15)
     except BaseException as ex:
-        log.error("Exception %s", ex)
+        log.error("Exception %s", traceback.format_exc(100))
         stop_all.set()
         raise ex
 
@@ -172,6 +195,9 @@ def get_etcd_headers():
                     "password": etcd_password()
                 }
             )
+            if rv.json()['header']['cluster_id']!=get_etcd_cluster_id():
+                raise RuntimeError("Cluster id mismatch: expected %s, got %s"%(get_etcd_cluster_id(), json['header']['cluster_id']))
+
             thread_local.etcd_token=rv.json()["token"]
             return {"Authorization": thread_local.etcd_token}
     return {}
@@ -193,6 +219,10 @@ def query_etcd(suburl:str, js:dict):
         reply = get_sess().post(etcd_url()+suburl, json=js, headers=get_etcd_headers())
         reply_json = reply.json()
         log.debug("Json:%s" % reply_json)
+
+        if reply_json['header']['cluster_id']!=get_etcd_cluster_id():
+            raise RuntimeError("Cluster id mismatch: expected %s, got %s"%(get_etcd_cluster_id(), json['header']['cluster_id']))
+
         if reply_json.get("kvs")!=None and len(reply_json.get("kvs"))>0:
             return True, reply_json, 0, None
         else:
@@ -236,13 +266,6 @@ def put_proposed_block_to_etcd():
                     time.sleep(timeout)
                     continue
 
-                with cns.connection() as cn, cn.cursor() as cr:
-                    cr.execute("select exists(select * from ldg.etcd where cluster_id=%s)", [json["header"]["cluster_id"]])
-                    cluster_ok = cr.fetchone()[0]
-                    if not cluster_ok:
-                        log.error("json:%s", pprint.pp(json))
-                        raise RuntimeError("Unknown etcd cluster:%s"%(json["header"]["cluster_id"]))
-
                 if json.get("kvs")!=None and len(json.get("kvs"))>0:
                     height = base64.standard_b64decode(json["kvs"][0]["key"]).decode()
                     height = int(re.sub(ldg_prefix()+"0{,14}","", height))
@@ -250,7 +273,8 @@ def put_proposed_block_to_etcd():
                     height=-1
 
 
-                with cns.connection() as cn, cn.cursor() as cr:
+                with get_cn() as cn, cn.cursor() as cr:
+                    cn.autocommit=True
                     cr.execute("select coalesce(max(height),-1) from ldg.ldg")
                     my_height = cr.fetchone()[0]
                 log.debug("My height is %s", my_height)
@@ -269,6 +293,10 @@ def put_proposed_block_to_etcd():
                             log.error("Unexpected reply when trying to get id of block at height %s"%(ch))
                             return
                         reply_json : dict = reply.json()
+
+                        if reply_json['header']['cluster_id']!=get_etcd_cluster_id():
+                            raise RuntimeError("Cluster id mismatch: expected %s, got %s"%(get_etcd_cluster_id(), json['header']['cluster_id']))
+
                     except (requests.exceptions.RequestException, json.decoder.JSONDecodeError) as ex:
                         msg = "Connection or parsing error:" + str(ex)
                         logging.warning(msg)
@@ -278,6 +306,7 @@ def put_proposed_block_to_etcd():
                     if reply_json.get("kvs") is None and ch>0:
                         msg = "Get empty kvs for page defined in etcd"
                         log.critical(msg)
+                        stop_all.set()
                         raise Exception(msg)
 
                     if reply_json.get("kvs") is not None:
@@ -287,11 +316,12 @@ def put_proposed_block_to_etcd():
                             log.error("json:{}", reply_json)
 
                         with cn.cursor() as cr:
+                            cn.autocommit=True
                             cr.execute("call ldg.apply_proposed_block(%s)", (block_uuid,))
                             log.info("Block %s at height %s has been applied", block_uuid, ch)
 
                 log.debug("Going to create proposed block")
-                with cns.connection() as cn, cn.cursor() as cr:
+                with get_cn() as cn, cn.cursor() as cr:
                     cn.autocommit=True
                     cr.execute("call ldg.make_proposed_block()")
                     log.debug("Call to ldg.make_proposed_block() is done")
@@ -332,6 +362,9 @@ def put_proposed_block_to_etcd():
                 if reply.json().get("error") is not None:
                     raise RuntimeError(reply.json()["error"])
 
+                if reply.json()['header']['cluster_id']!=get_etcd_cluster_id():
+                    raise RuntimeError("Cluster id mismatch: expected %s, got %s"%(get_etcd_cluster_id(), json['header']['cluster_id']))
+
             except BaseException as ex:
                 exc_type, exc_value, exc_traceback = sys.exc_info()
                 log.error("Exception(%s) %s", ex.__class__, ex)
@@ -350,14 +383,17 @@ def put_proposed_block_to_etcd():
 
 def clear_gsp():
     log=logging.getLogger("clear_gsp")
+    last_run=0
     try:
         while True:
             if stop_all.isSet():
                 return
-            with cns.connection() as cn, cn.cursor() as cr:
-                cn.autocommit=True
-                cr.execute("call gsp.clear_gsp()")
-            time.sleep(60)
+            if time.time()-last_run>=60:
+                with get_cn() as cn, cn.cursor() as cr:
+                    cn.autocommit=True
+                    cr.execute("call gsp.clear_gsp()")
+                last_run=time.time()
+            time.sleep(1)
     except BaseException as ex:
         log.error("Exception %s", ex)
         stop_all.set()
@@ -366,14 +402,17 @@ def clear_gsp():
 
 def clear_txpool():
     log=logging.getLogger("clear_txpool")
+    last_run=0
     try:
         while True:
             if stop_all.isSet():
                 return
-            with cns.connection() as cn, cn.cursor() as cr:
-                cn.autocommit=True
-                cr.execute("call ldg.clear_txpool()")
-            time.sleep(60)
+            if time.time()-last_run>=60:
+                with get_cn() as cn, cn.cursor() as cr:
+                    cn.autocommit=True
+                    cr.execute("call ldg.clear_txpool()")
+                last_run=time.time()
+            time.sleep(1)
     except BaseException as ex:
         log.error("Exception %s", ex)
         stop_all.set()
