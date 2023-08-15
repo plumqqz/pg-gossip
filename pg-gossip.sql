@@ -84,9 +84,11 @@ call exec_at_all_hosts($sql2script$
 --create table gsp.gsp(
 -- uuid uuid primary key,
 -- topic varchar(64) not null check (topic ~ '^[a-zA-Z_][-_a-zA-Z0-9]*$'),
--- payload json
+-- payload json,
+-- seenby text[] not null default array[]::text[]
 --);
 --
+--alter table gsp.gsp add seenby text[] not null default array[]::text[]; 
 --create table gsp.peer(
 -- name varchar(64) primary key check (name ~ '^[a-zA-Z][-_a-zA-Z0-9]*$'),
 -- conn_str text not null,
@@ -134,8 +136,8 @@ call exec_at_all_hosts($sql2script$
 --declare
 --    r record;
 --begin
---    insert into gsp.gsp select gsps.* from unnest(gsps) as gsps on conflict do nothing;
---    insert into gsp.peer_gsp select p.name, gsps.uuid from gsp.peer p, unnest(gsps) as gsps on conflict do nothing;      
+--    insert into gsp.gsp select gsps.uuid, gsps.topic, gsps.payload, gsps.seenby || self.name from unnest(gsps) as gsps, gsp.self on conflict do nothing;
+--    insert into gsp.peer_gsp select p.name, gsps.uuid from gsp.peer p, unnest(gsps) as gsps where p.name<>all(gsps.seenby) on conflict do nothing;      
 --    for r in select gsp.*, m.* from unnest(gsps) as gsp, gsp.mapping m where m.topic like gsp.topic loop
 --        execute format('select %s($1, $2)', r.handler) using r.uuid, r.payload;
 --    end loop;
@@ -149,46 +151,47 @@ call exec_at_all_hosts($sql2script$
 --declare
 -- iuuid uuid = gsp.gen_v7_uuid();
 --begin
---    perform gsp.send_gsp(array[(iuuid, topic, payload)::gsp.gsp]);
+--    perform gsp.send_gsp(array[(iuuid, topic, payload, array(select name from gsp.self))::gsp.gsp]);
 --    return iuuid;
 --end;
 --$code$
 --language plpgsql;
 
---create or replace function gsp.spread_gossips(peer_name text) returns int as
---$code$
---declare
---    gsps uuid[]=array(select pg.gsp_uuid 
---                        from gsp.peer_gsp pg 
---                       where pg.peer_name=spread_gossips.peer_name
---                         and pg.gsp_uuid>gsp.gen_v7_uuid(now()::timestamp-make_interval(days:=1))
---                    order by gsp_uuid for update skip locked limit 10000);
---    sendme uuid[];
---    conn_str text = (select p.conn_str from gsp.peer p where p.name=spread_gossips.peer_name);
---    self gsp.self;
---begin
---    if conn_str is null then
---        raise notice 'spread_gossips(%):Unknown peer:%', (select name from gsp.self), peer_name;
---        return 0; 
---    end if;
---    if cardinality(gsps)=0 then
---        return 0;
---    end if;
---    select * into self from gsp.self;
---    sendme=array(select uuid from dblink.dblink(conn_str, 
---        format($q$select uuid from gsp.i_have(%L) where gsp.check_group(%L)$q$, gsps, self.group_name)) as rs(uuid uuid));
---    update gsp.peer set connected_at=now() where name=peer_name;
---    if sendme is null or cardinality(sendme)=0 then
---        delete from gsp.peer_gsp pg where pg.peer_name=spread_gossips.peer_name and pg.gsp_uuid=any(gsps);
---        return 0;
---    end if;
---    perform from dblink.dblink(conn_str,format('select gsp.send_gsp(%L::gsp.gsp[])', (select array_agg(gsp) from gsp.gsp where uuid=any(sendme)))) as rs(v text);
---    delete from gsp.peer_gsp pg where pg.peer_name=spread_gossips.peer_name and pg.gsp_uuid=any(gsps);
---    call gsp.clear_gsp();
---    return cardinality(gsps);
---end;
---$code$
---language plpgsql;
+create or replace function gsp.spread_gossips(peer_name text) returns int as
+$code$
+declare
+    gsps uuid[]=array(select pg.gsp_uuid 
+                        from gsp.peer_gsp pg 
+                       where pg.peer_name=spread_gossips.peer_name
+                         and pg.gsp_uuid>gsp.gen_v7_uuid(now()::timestamp-make_interval(days:=1))
+                    order by gsp_uuid for update skip locked limit 10000);
+    sendme uuid[];
+    conn_str text = (select p.conn_str from gsp.peer p where p.name=spread_gossips.peer_name);
+    self gsp.self;
+begin
+    if conn_str is null then
+        raise notice 'spread_gossips(%):Unknown peer:%', (select name from gsp.self), peer_name;
+        return 0; 
+    end if;
+    if cardinality(gsps)=0 then
+        return 0;
+    end if;
+    select * into self from gsp.self;
+    sendme=array(select uuid from dblink.dblink(conn_str, 
+        format($q$select uuid from gsp.i_have(%L) where gsp.check_group(%L)$q$, gsps, self.group_name)) as rs(uuid uuid));
+    update gsp.peer set connected_at=now() where name=peer_name;
+    if sendme is null or cardinality(sendme)=0 then
+        delete from gsp.peer_gsp pg where pg.peer_name=spread_gossips.peer_name and pg.gsp_uuid=any(gsps);
+        return 0;
+    end if;
+    perform from dblink.dblink(conn_str,format('select gsp.send_gsp(%L::gsp.gsp[])', (select array_agg(gsp) from gsp.gsp where uuid=any(sendme)))) as rs(v text);
+    delete from gsp.peer_gsp pg where pg.peer_name=spread_gossips.peer_name and pg.gsp_uuid=any(gsps);
+    call gsp.clear_gsp();
+    return cardinality(gsps);
+end;
+$code$
+language plpgsql
+set enable_seqscan to false;
 
 
 
@@ -410,7 +413,8 @@ call exec_at_all_hosts($sql2script$
 --    end if;
 --end;
 --$code$
---language plpgsql;
+--language plpgsql
+-- set enable_seqscan to off;
 
 --create or replace function ldg.expand_ldg_payload_uuids(ldg ldg.ldg) returns uuid[] as
 --$code$
