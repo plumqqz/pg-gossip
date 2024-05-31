@@ -1,3 +1,4 @@
+import json
 import time
 from queue import Queue
 import psycopg2
@@ -5,15 +6,22 @@ import psycopg2.extras
 import concurrent.futures
 import re
 import logging
+import fcntl
 
+import pkgutil
+import traceback
+import job_handlers
+import job_handlers.examples
 
 CONNECTION_COUNT=2
 CQ = Queue(maxsize=CONNECTION_COUNT)
 TP = concurrent.futures.ThreadPoolExecutor(max_workers=CONNECTION_COUNT)
 
+PYTHON_HANDLERS={}
+
 def exec_job(cn, row):
     try:
-        if not re.fullmatch(r'[a-zA-Z.0-9_]+', row['action']):
+        if not re.fullmatch(r'[:a-zA-Z.0-9_]+', row['action']):
             raise RuntimeError("Wrong action:"+row['action'])
 
         if row['type']=='sql':
@@ -22,10 +30,10 @@ def exec_job(cn, row):
                             " update playground.job set finished_at=case when tq.reply is null then now() else null end, next_run_at=(tq.reply->>'next_run')::timestamp,"
                             " error_message=null, context=tq.reply->'context' from tq where job.id=%s returning context", [row['id'],row['id']])
         elif row['type']=='python':
-            res=row['action'](row['params'], row['context'])
+            res = pkgutil.resolve_name('job_handlers:handlers')[row['action']](row['params'], row['context'] if row['context'] else {})
             if res is not None:
                 with cn, cn.cursor() as cur:
-                    cur.execute("update playground.job set next_run_at= next_run_at+make_interval(secs := %s), context= %s where id=%s", [res['next_run_after_secs'],row['context'], row['id']])
+                    cur.execute("update playground.job set next_run_at= clock_timestamp()+make_interval(secs := %s), context= %s where id=%s", [float(res['next_run_after_secs']),json.dumps(res), row['id']])
             else:
                 with cn, cn.cursor() as cur:
                     cur.execute('update playground.job set next_run_at= null where id=%s', [row['id']])
@@ -33,7 +41,8 @@ def exec_job(cn, row):
             raise RuntimeError("Unknown job type:"+row['type'])
 
     except Exception as e:
-        logging.error("Exception:%s", e)
+        traceback.print_exc()
+        logging.error("Exception:%s", str(e))
         with cn, cn.cursor() as cur:
             cur.execute("rollback")
             cur.execute("update playground.job set error_message= %s where id=%s", [str(e),row['id']])
@@ -45,22 +54,26 @@ def exec_job(cn, row):
 
 def run():
     while True:
-        cn = CQ.get(True)
-        found=False
-        with cn, cn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute("select * from playground.job"+
-                        " where error_message is null and next_run_at <now() and not exists(select * from pg_stat_activity where application_name='job_executor:job_id:'||job.id)"+
-                        " order by created_at limit 1 for update skip locked")
-            row = cur.fetchone()
-            if not row is None:
-                found=True
-                cur.execute("set application_name to %s", ['job_executor:job_id:' + str(row['id'])])
-        if not found:
-            CQ.put(cn)
-            time.sleep(3)
-            continue
+        try:
+            cn = CQ.get(True)
+            found=False
+            with cn, cn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute("select * from playground.job"+
+                            " where error_message is null and next_run_at <now() and not exists(select * from pg_stat_activity where application_name='job_executor:job_id:'||job.id)"+
+                            " order by created_at limit 1 for update skip locked")
+                row = cur.fetchone()
+                if not row is None:
+                    found=True
+                    cur.execute("set application_name to %s", ['job_executor:job_id:' + str(row['id'])])
+            if not found:
+                CQ.put(cn)
+                time.sleep(3)
+                continue
 
-        TP.submit(exec_job, cn, row)
+            TP.submit(exec_job, cn, row)
+        except Exception as e:
+            traceback.print_exc()
+            logging.error("Exception:%s", str(e))
 
 
 def setConnectionApplicationNameToIdle(cn):
@@ -69,9 +82,14 @@ def setConnectionApplicationNameToIdle(cn):
 
 
 if __name__ == '__main__':
-    for i in range(CONNECTION_COUNT):
-        cn=psycopg2.connect("host=localhost port=5432 dbname=work user=postgres password=root")
-        setConnectionApplicationNameToIdle(cn)
-        CQ.put(cn, True)
+    with open(__file__,"r") as file:
+        try:
+            if fcntl.flock(file.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB) is None:
+                for i in range(CONNECTION_COUNT):
+                    cn=psycopg2.connect("host=localhost port=5432 dbname=work user=postgres password=root")
+                    setConnectionApplicationNameToIdle(cn)
+                    CQ.put(cn, True)
 
-    run()
+                run()
+        except BlockingIOError as e:
+            None
