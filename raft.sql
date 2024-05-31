@@ -1,7 +1,7 @@
 -- CONNECTION: url=jdbc:postgresql://localhost:5432/work
 /*
  * воркеры - у каждого интервал запуска 3 сек
- * начинатель голосования - проверяет, что next_election>now() && state<>'LEADER' и если да, 
+ * начинатель голосования - проверяет, что next_election>now() && state='FOLLOWER' и если да, 
  *      переключает свою ноду в CANDIDATE
  *      сбрасывает state.leader_name
  *      инкрементирует term
@@ -151,7 +151,7 @@ language plpgsql;
 create or replace function raft.start_voting_job(params jsonb, ctx in out jsonb, next_run out interval)  as
 $code$
 /*
- * начинатель голосования - проверяет, что next_election>now() && state<>'LEADER' и если да, 
+ * начинатель голосования - проверяет, что next_election>now() && state='FOLLOWER' и если да, 
  *      переключает свою ноду в CANDIDATE
  *      сбрасывает state.leader_name
  *      инкрементирует term
@@ -165,7 +165,7 @@ begin
             state='CANDIDATE', current_term=current_term+1, voted_for_me_in_current_term=1, 
             voted_for=self, leader_name=null,
             next_election=now()+make_interval(secs=10+10*random())
-        where next_election>now() and state.state in ('FOLLOWER','CANDIDATE');
+        where next_election>now() and state.state in ('FOLLOWER');
     ctx=jsonb_build_object();
 end;
 $code$
@@ -188,7 +188,9 @@ declare
   self raft.state;
   rt int; -- Remote Term
   vg boolean; -- Vote Granted
+  vr constant int=(select count(*)/2+1 from raft.peer); -- Votes Required
 begin
+    next_run=make_interval(secs=3);
 -- initial setup; in self we will use only such fields, which are constant, for volatile fields we must use queries
     select * into self from raft.state;
     if not found then
@@ -198,10 +200,12 @@ begin
     if not found then
         raise sqlstate 'RF003' using message=format('Peer with name=%s is not found', params->>'peer_name');
     end if;
---
-    next_run=make_interval(secs=3);
-    ctx['last_seen_term']=self.current_term;
 -- real work goes here
+    if (ctx->>'last_seen_term')::int >= self.current_term then
+        return;
+    end if;
+--
+    ctx['last_seen_term']=self.current_term;
     begin
        select *
             into rt, vg
@@ -220,13 +224,15 @@ begin
     if found then
         return;
     end if;
-    update raft.state set state='LEADER', voted_for_me_in_current_term=voted_for_me_in_current_term+1, leader_name=null
-    where state.voted_for_me_in_current_term+1>(select count(*)/2+1 from raft.peer) and state='CANDIDATE';
+    update raft.state set 
+        state=case when state.voted_for_me_in_current_term+1>=vr then 'LEADER' else state.state end,
+        voted_for_me_in_current_term=voted_for_me_in_current_term+1, 
+        leader_name=case when state.voted_for_me_in_current_term+1>=vr then state.self else null end
+    where state.state='CANDIDATE' and vg;
 end;
 $code$
 language plpgsql;
  
-
 
 do $code$
  declare

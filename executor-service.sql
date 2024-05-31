@@ -95,27 +95,22 @@ begin
             continue;
         end if;
         begin
-            execute 'select * from '||r.fn||'($1,$2)' using r.params, r.context into context, nr;
+            execute 'select * from '||r.fn||'($1,$2)' using r.params, coalesce(r.context, jsonb_build_object()) into context, nr;
             ok=true;
         exception
             when others then ok=false; ss=sqlstate; errm=sqlerrm;
         end;
 --
         if ok then
-            if nr is not null then
-                update raft.executor_service es 
-                        set context=code.context, error_message=code.context->>'error_message', sqlstate=null, 
-                        is_done=case when nr is null then true else false end,
-                        run_at=clock_timestamp()+coalesce(nr, make_interval())
+            update raft.executor_service es 
+                    set context=code.context, error_message=code.context->>'error_message', sqlstate=null, 
+                    is_done=case when nr is null then true else false end,
+                    run_at=clock_timestamp()+nr
                 where es.uuid=r.uuid;
-            else
-                delete from raft.executor_service es1 where es1.uuid=r.uuid 
-                    and not exists(select * from raft.executor_service es2 where es2.depends_on && array[r.uuid]);
-            end if;
             commit;
         else
             rollback;
-            update raft.executor_service es set result=null, error_message=errm, sqlstate=ss, is_done=true where es.uuid=r.uuid;
+            update raft.executor_service es set error_message=errm, sqlstate=ss, is_done=true where es.uuid=r.uuid;
         end if;
     end loop;    
 end;
@@ -134,6 +129,16 @@ $code$
 $code$
 language sql;
 
+create or replace function raft.clear_jobs(params jsonb, ctx in out jsonb, next_run out interval) as
+$code$
+begin
+    next_run:=make_interval(secs:=60);
+    delete from raft.executor_service as es1 where es1.is_done
+        and not exists(select * from raft.executor_service es2 where not es2.is_done and es2.depends_on && array[es1.uuid]);
+end;
+$code$
+language plpgsql;
+
 
 
 create or replace function raft.es_test(params jsonb, ctx in out jsonb, next_run out interval) as
@@ -143,8 +148,11 @@ declare
 begin
     insert into raft.ll values(format('%s:%s', cnt, params->>'message'));
     if cnt<3 then
-        ctx=jsonb_build_object('cnt',cnt+1, 'error_message', format('%s processed', cnt)); next_run=make_interval(secs:=3);
+        --ctx=jsonb_build_object('cnt',cnt+1, 'error_message', format('%s processed', cnt)); 
         cnt=cnt+1;
+        next_run=make_interval(secs:=3);
+        ctx['cnt']=cnt;
+        ctx['error_message']=to_jsonb(format('%s processed', cnt));
     else
         return;
     end if;
@@ -180,6 +188,10 @@ select count(*) from raft.ll
 
 select * from raft.ll
 
+select * from raft.executor_service es 
+
+drop FUNCTION raft.submit(fn text, params jsonb)
+
 commit
 
 delete from raft.ll
@@ -188,7 +200,11 @@ vacuum verbose raft.ll
 
 insert into raft.executor_service(uuid,fn, params)values(gsp.gen_v7_uuid(), 'raft.es_test', jsonb_build_object('message','"message"'));
 
-select raft.submit('raft.es_test'::text, jsonb_build_object('message','next attempt'))
+select raft.submit('raft.es_test', jsonb_build_object('message','next attempt'))
+
+select raft.submit('raft.clear_jobs', jsonb_build_object())
+
+select * from raft.executor_service es 
 
 
 
@@ -198,7 +214,7 @@ select count(*) from raft.executor_service
 
 select * from raft.executor_service
 
-
+select to_json(format('%s rows processed', 10))
 
 
 
@@ -218,3 +234,8 @@ begin
     raise notice 'v=% res=%', v, res;
 end;
 $code$
+
+
+select to_json(row(gen_random_uuid()))
+
+select gen_random_uuid()::text::jsonb;
